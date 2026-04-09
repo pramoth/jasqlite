@@ -11,6 +11,7 @@ public class TableInfo {
     public int rootPage;
     public String sql;
     public List<ColumnInfo> columns;
+    public List<ForeignKeyInfo> foreignKeys;
     public String withoutRowid;
     public String strict;
     

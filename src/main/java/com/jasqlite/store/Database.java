@@ -207,6 +207,7 @@ public class Database implements AutoCloseable {
         info.rootPage = entry.rootpage;
         info.sql = entry.sql;
         info.columns = new ArrayList<>();
+        info.columnExpressions = new ArrayList<>();
         info.descending = new ArrayList<>();
         if (entry.sql != null) {
             try {
@@ -219,8 +220,9 @@ public class Database implements AutoCloseable {
                             if (ic.expression instanceof Expressions.ColumnRef) {
                                 info.columns.add(((Expressions.ColumnRef) ic.expression).columnName);
                             } else if (ic.expression != null) {
-                                info.columns.add(ic.expression.toString());
+                                info.columns.add(exprToSQL(ic.expression));
                             }
+                            info.columnExpressions.add(ic.expression);
                             info.descending.add(ic.order == Enums.OrderDirection.DESC);
                         }
                     }
@@ -374,11 +376,14 @@ public class Database implements AutoCloseable {
         if (stmt.unique) {
             java.util.Set<String> seen = new java.util.LinkedHashSet<>();
             for (BTree.RecordWithRowid rwr : rows) {
-                if (stmt.where != null) {
-                    SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
-                    if (!matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
+                SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
+                if (stmt.where != null && !matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
+                Record keyRecord = buildPopulateKeyRecord(stmt, table, rowValues, rwr.rowid);
+                boolean hasNull = false;
+                for (int i = 0; i < keyRecord.getColumnCount(); i++) {
+                    if (keyRecord.getValue(i).isNull()) { hasNull = true; break; }
                 }
-                Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
+                if (hasNull) continue;
                 String keyStr = keyRecord.serialize() != null ? java.util.Arrays.toString(keyRecord.serialize()) : "";
                 if (!seen.add(keyStr)) {
                     throw new SQLException("UNIQUE constraint failed: " + stmt.indexName);
@@ -386,14 +391,43 @@ public class Database implements AutoCloseable {
             }
         }
         for (BTree.RecordWithRowid rwr : rows) {
-            if (stmt.where != null) {
-                SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
-                if (!matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
-            }
-            Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
+            SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
+            if (stmt.where != null && !matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
+            Record keyRecord = buildPopulateKeyRecord(stmt, table, rowValues, rwr.rowid);
             keyRecord.addValue(SQLiteValue.fromLong(rwr.rowid));
             btree.insertIndex(rootPage, keyRecord.serialize());
         }
+    }
+
+    private Record buildPopulateKeyRecord(CreateIndexStatement stmt, TableInfo table, SQLiteValue[] rowValues, long rowid) {
+        QueryPlanner.TableRow tr = new QueryPlanner.TableRow();
+        tr.tableName = table.name;
+        tr.rowid = rowid;
+        tr.columnNames = new ArrayList<>();
+        tr.tableNames = new ArrayList<>();
+        tr.values = rowValues;
+        for (ColumnInfo ci : table.columns) {
+            tr.columnNames.add(ci.name);
+            tr.tableNames.add(table.name);
+        }
+
+        Record keyRecord = new Record();
+        if (stmt.columns != null) {
+            for (IndexedColumn ic : stmt.columns) {
+                if (ic.expression instanceof Expressions.ColumnRef) {
+                    String colName = ((Expressions.ColumnRef) ic.expression).columnName;
+                    int colIdx = table.getColumnIndex(colName);
+                    keyRecord.addValue(colIdx >= 0 && colIdx < rowValues.length ? rowValues[colIdx] : SQLiteValue.fromNull());
+                } else {
+                    try {
+                        keyRecord.addValue(queryPlanner.evaluateExpression(ic.expression, tr, null));
+                    } catch (Exception e) {
+                        keyRecord.addValue(SQLiteValue.fromNull());
+                    }
+                }
+            }
+        }
+        return keyRecord;
     }
 
     private int findPkColIndex(TableInfo table) {
@@ -436,38 +470,6 @@ public class Database implements AutoCloseable {
         } catch (Exception e) {
             return true;
         }
-    }
-
-    private Record buildIndexKeyFromRecord(TableInfo table, CreateIndexStatement stmt, BTree.RecordWithRowid rwr) {
-        int pkColIndex = -1;
-        for (int i = 0; i < table.columns.size(); i++) {
-            ColumnInfo ci = table.columns.get(i);
-            if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) {
-                pkColIndex = i;
-                break;
-            }
-        }
-
-        Record keyRecord = new Record();
-        if (stmt.columns != null) {
-            for (IndexedColumn ic : stmt.columns) {
-                if (ic.expression instanceof Expressions.ColumnRef) {
-                    String colName = ((Expressions.ColumnRef) ic.expression).columnName;
-                    int logicalIdx = table.getColumnIndex(colName);
-                    if (logicalIdx >= 0) {
-                        int recordIdx = logicalIdx;
-                        if (pkColIndex >= 0 && logicalIdx > pkColIndex) {
-                            recordIdx--;
-                        } else if (pkColIndex >= 0 && logicalIdx == pkColIndex) {
-                            keyRecord.addValue(SQLiteValue.fromLong(rwr.rowid));
-                            continue;
-                        }
-                        keyRecord.addValue(rwr.record.getValue(recordIdx));
-                    }
-                }
-            }
-        }
-        return keyRecord;
     }
 
     public void dropTable(String tableName) throws SQLException {
@@ -925,22 +927,50 @@ public class Database implements AutoCloseable {
         }
     }
 
+    private Record buildIndexKeyRecord(IndexInfo idx, TableInfo table, SQLiteValue[] rowValues, long rowid) {
+        QueryPlanner.TableRow tr = new QueryPlanner.TableRow();
+        tr.tableName = table.name;
+        tr.rowid = rowid;
+        tr.columnNames = new ArrayList<>();
+        tr.tableNames = new ArrayList<>();
+        tr.values = rowValues;
+        for (ColumnInfo ci : table.columns) {
+            tr.columnNames.add(ci.name);
+            tr.tableNames.add(table.name);
+        }
+
+        Record keyRecord = new Record();
+        if (idx.columnExpressions != null) {
+            for (Expression expr : idx.columnExpressions) {
+                if (expr instanceof Expressions.ColumnRef) {
+                    String colName = ((Expressions.ColumnRef) expr).columnName;
+                    int colIdx = table.getColumnIndex(colName);
+                    keyRecord.addValue(colIdx >= 0 && colIdx < rowValues.length ? rowValues[colIdx] : SQLiteValue.fromNull());
+                } else {
+                    try {
+                        keyRecord.addValue(queryPlanner.evaluateExpression(expr, tr, null));
+                    } catch (Exception e) {
+                        keyRecord.addValue(SQLiteValue.fromNull());
+                    }
+                }
+            }
+        } else {
+            for (String idxCol : idx.columns) {
+                int colIdx = table.getColumnIndex(idxCol);
+                keyRecord.addValue(colIdx >= 0 && colIdx < rowValues.length ? rowValues[colIdx] : SQLiteValue.fromNull());
+            }
+        }
+        keyRecord.addValue(SQLiteValue.fromLong(rowid));
+        return keyRecord;
+    }
+
     private void insertIntoIndexes(TableInfo table, SQLiteValue[] rowValues, long rowid) throws IOException {
         for (IndexInfo idx : indexes.values()) {
             if (!idx.tableName.equalsIgnoreCase(table.name)) continue;
             if (idx.columns == null || idx.columns.isEmpty()) continue;
             if (!matchesIndexWhere(idx, table, rowValues, rowid)) continue;
 
-            Record keyRecord = new Record();
-            for (String idxCol : idx.columns) {
-                int colIdx = table.getColumnIndex(idxCol);
-                if (colIdx >= 0 && colIdx < rowValues.length) {
-                    keyRecord.addValue(rowValues[colIdx]);
-                } else {
-                    keyRecord.addValue(SQLiteValue.fromNull());
-                }
-            }
-            keyRecord.addValue(SQLiteValue.fromLong(rowid));
+            Record keyRecord = buildIndexKeyRecord(idx, table, rowValues, rowid);
             btree.insertIndex(idx.rootPage, keyRecord.serialize());
         }
     }
@@ -978,26 +1008,20 @@ public class Database implements AutoCloseable {
 
             if (idx.whereExpr != null && !matchesIndexWhere(idx, table, rowValues, 0)) continue;
 
-            Record keyRecord = new Record();
-            for (String idxCol : idx.columns) {
-                int colIdx = table.getColumnIndex(idxCol);
-                if (colIdx >= 0 && colIdx < rowValues.length) {
-                    keyRecord.addValue(rowValues[colIdx]);
-                } else {
-                    keyRecord.addValue(SQLiteValue.fromNull());
-                }
-            }
+            Record keyRecord = buildIndexKeyRecord(idx, table, rowValues, excludeRowid < 0 ? 0 : excludeRowid);
+            // Remove trailing rowid for comparison
+            int keyColCount = keyRecord.getColumnCount() - 1;
 
             List<byte[]> indexEntries = btree.scanIndex(idx.rootPage);
             for (byte[] entry : indexEntries) {
                 Record rec = Record.deserialize(entry, 0).record;
-                if (rec.getColumnCount() < keyRecord.getColumnCount()) continue;
+                if (rec.getColumnCount() < keyColCount) continue;
 
                 long entryRowid = rec.getValue(rec.getColumnCount() - 1).asLong();
                 if (entryRowid == excludeRowid) continue;
 
                 boolean match = true;
-                for (int i = 0; i < keyRecord.getColumnCount(); i++) {
+                for (int i = 0; i < keyColCount; i++) {
                     SQLiteValue a = keyRecord.getValue(i);
                     SQLiteValue b = rec.getValue(i);
                     if (a.isNull() || b.isNull()) { match = false; break; }
@@ -1339,7 +1363,7 @@ public class Database implements AutoCloseable {
                 if (ic.expression instanceof Expressions.ColumnRef) {
                     sb.append(quoteIdentifier(((Expressions.ColumnRef) ic.expression).columnName));
                 } else if (ic.expression != null) {
-                    sb.append(ic.expression);
+                    sb.append(exprToSQL(ic.expression));
                 }
                 if (ic.order == Enums.OrderDirection.DESC) sb.append(" DESC");
             }

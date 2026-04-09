@@ -294,7 +294,7 @@ public class SQLParser {
             else if (match(TokenType.DEFAULT)) { DefaultColumnConstraint dc = new DefaultColumnConstraint(); dc.expression = parseExpression(); col.constraints.add(dc); }
             else if (match(TokenType.CHECK)) { CheckColumnConstraint cc = new CheckColumnConstraint(); expect(TokenType.LPAREN); cc.expression = parseExpression(); expect(TokenType.RPAREN); col.constraints.add(cc); }
             else if (match(TokenType.COLLATE)) { CollateColumnConstraint cc = new CollateColumnConstraint(); cc.collationName = expectName(); col.constraints.add(cc); }
-            else if (match(TokenType.REFERENCES)) { ForeignKeyColumnConstraint fk = new ForeignKeyColumnConstraint(); fk.foreignTable = expectName(); col.constraints.add(fk); }
+            else if (match(TokenType.REFERENCES)) { ForeignKeyColumnConstraint fk = new ForeignKeyColumnConstraint(); fk.foreignTable = expectName(); if (match(TokenType.LPAREN)) { fk.foreignColumns = new ArrayList<>(); do { fk.foreignColumns.add(expectName()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); } if (match(TokenType.ON)) { if (match(TokenType.DELETE)) { fk.onDelete = parseForeignKeyAction(); } else if (match(TokenType.UPDATE)) { fk.onUpdate = parseForeignKeyAction(); } } col.constraints.add(fk); }
             else break;
         }
         return col;
@@ -312,8 +312,16 @@ public class SQLParser {
         if (check(TokenType.PRIMARY)) { PrimaryKey pk = new PrimaryKey(); pk.name = cn; expect(TokenType.PRIMARY); expect(TokenType.KEY); expect(TokenType.LPAREN); pk.columns = new ArrayList<>(); do { pk.columns.add(parseIndexedColumn()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); if (match(TokenType.AUTOINCREMENT)) pk.autoIncrement = true; return pk; }
         if (match(TokenType.UNIQUE)) { Unique uq = new Unique(); uq.name = cn; expect(TokenType.LPAREN); uq.columns = new ArrayList<>(); do { uq.columns.add(parseIndexedColumn()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); return uq; }
         if (match(TokenType.CHECK)) { Check ck = new Check(); ck.name = cn; expect(TokenType.LPAREN); ck.expression = parseExpression(); expect(TokenType.RPAREN); return ck; }
-        if (match(TokenType.FOREIGN)) { ForeignKey fk = new ForeignKey(); fk.name = cn; expect(TokenType.KEY); expect(TokenType.LPAREN); fk.columns = new ArrayList<>(); do { fk.columns.add(expectName()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); expect(TokenType.REFERENCES); fk.foreignTable = expectName(); return fk; }
+        if (match(TokenType.FOREIGN)) { ForeignKey fk = new ForeignKey(); fk.name = cn; expect(TokenType.KEY); expect(TokenType.LPAREN); fk.columns = new ArrayList<>(); do { fk.columns.add(expectName()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); expect(TokenType.REFERENCES); fk.foreignTable = expectName(); if (match(TokenType.LPAREN)) { fk.foreignColumns = new ArrayList<>(); do { fk.foreignColumns.add(expectName()); } while (match(TokenType.COMMA)); expect(TokenType.RPAREN); } if (match(TokenType.ON)) { if (match(TokenType.DELETE)) { fk.onDelete = parseForeignKeyAction(); } else if (match(TokenType.UPDATE)) { fk.onUpdate = parseForeignKeyAction(); } } return fk; }
         throw new ParseException("Expected table constraint");
+    }
+
+    private Enums.ForeignKeyAction parseForeignKeyAction() throws ParseException {
+        if (match(TokenType.CASCADE)) return Enums.ForeignKeyAction.CASCADE;
+        if (match(TokenType.SET)) { expect(TokenType.NULL); return Enums.ForeignKeyAction.SET_NULL; }
+        if (match(TokenType.NO)) { expect(TokenType.ACTION); return Enums.ForeignKeyAction.NO_ACTION; }
+        if (match(TokenType.RESTRICT)) return Enums.ForeignKeyAction.RESTRICT;
+        return Enums.ForeignKeyAction.NO_ACTION;
     }
 
     private IndexedColumn parseIndexedColumn() throws ParseException {
