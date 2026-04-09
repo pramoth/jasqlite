@@ -329,7 +329,6 @@ public class Pager implements AutoCloseable {
                 }
             }
             freeListPageCount++;
-            cache.remove(pageNumber);
             dirtyPages.add(pageNumber);
         }
     }
