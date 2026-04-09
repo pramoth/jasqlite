@@ -970,8 +970,23 @@ public class QueryPlanner {
     }
 
     private Result executeAlterTable(AlterTableStatement stmt) throws Exception {
-        // ALTER TABLE is complex; support RENAME TO and ADD COLUMN
-        throw new Exception("ALTER TABLE is not yet fully supported");
+        switch (stmt.alterType) {
+            case RENAME_TO:
+                db.alterTableRenameTo(stmt.tableName, stmt.newTableName);
+                break;
+            case RENAME_COLUMN:
+                db.alterTableRenameColumn(stmt.tableName, stmt.renameColumnOld, stmt.renameColumnNew);
+                break;
+            case ADD_COLUMN:
+                db.alterTableAddColumn(stmt.tableName, stmt.addColumn);
+                break;
+            case DROP_COLUMN:
+                db.alterTableDropColumn(stmt.tableName, stmt.dropColumnName);
+                break;
+            default:
+                throw new Exception("Unsupported ALTER TABLE operation");
+        }
+        return Result.EMPTY;
     }
 
     private Result executeDropTable(DropTable stmt) throws Exception {

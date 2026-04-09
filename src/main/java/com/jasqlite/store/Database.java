@@ -119,6 +119,7 @@ public class Database implements AutoCloseable {
         info.rootPage = entry.rootpage;
         info.sql = entry.sql;
         info.columns = new ArrayList<>();
+        info.foreignKeys = new ArrayList<>();
 
         if (entry.sql != null) {
             try {
@@ -148,19 +149,26 @@ public class Database implements AutoCloseable {
                                             ? ((Constraints.DefaultColumnConstraint) cc).expression.toString() : null;
                                     } else if (cc instanceof Constraints.CollateColumnConstraint) {
                                         ci.collation = ((Constraints.CollateColumnConstraint) cc).collationName;
+                                    } else if (cc instanceof Constraints.ForeignKeyColumnConstraint) {
+                                        Constraints.ForeignKeyColumnConstraint fkcc = (Constraints.ForeignKeyColumnConstraint) cc;
+                                        ForeignKeyInfo fk = new ForeignKeyInfo();
+                                        fk.columns = java.util.Collections.singletonList(ci.name);
+                                        fk.foreignTable = fkcc.foreignTable;
+                                        fk.foreignColumns = fkcc.foreignColumns;
+                                        fk.onDelete = fkcc.onDelete;
+                                        fk.onUpdate = fkcc.onUpdate;
+                                        info.foreignKeys.add(fk);
                                     }
                                 }
                             }
                             info.columns.add(ci);
                         }
                     }
-                    // Check table-level constraints
                     if (ct.constraints != null) {
                         for (TableConstraint tc : ct.constraints) {
                             if (tc instanceof TableConstraint.PrimaryKey) {
                                 TableConstraint.PrimaryKey pk = (TableConstraint.PrimaryKey) tc;
                                 if (pk.columns != null && pk.columns.size() == 1) {
-                                    // Mark the column as primary key
                                     for (ColumnInfo ci : info.columns) {
                                         IndexedColumn ic = pk.columns.get(0);
                                         if (ic.expression instanceof Expressions.ColumnRef) {
@@ -171,6 +179,15 @@ public class Database implements AutoCloseable {
                                         }
                                     }
                                 }
+                            } else if (tc instanceof TableConstraint.ForeignKey) {
+                                TableConstraint.ForeignKey tfk = (TableConstraint.ForeignKey) tc;
+                                ForeignKeyInfo fk = new ForeignKeyInfo();
+                                fk.columns = tfk.columns;
+                                fk.foreignTable = tfk.foreignTable;
+                                fk.foreignColumns = tfk.foreignColumns;
+                                fk.onDelete = tfk.onDelete;
+                                fk.onUpdate = tfk.onUpdate;
+                                info.foreignKeys.add(fk);
                             }
                         }
                     }
@@ -453,6 +470,193 @@ public class Database implements AutoCloseable {
         return null;
     }
 
+    public void alterTableRenameTo(String oldName, String newName) throws SQLException {
+        synchronized (lock) {
+            try {
+                String key = oldName.toLowerCase();
+                TableInfo table = tables.get(key);
+                if (table == null) throw new SQLException("no such table: " + oldName);
+                if (tables.containsKey(newName.toLowerCase())) throw new SQLException("there is already another table or index with this name: " + newName);
+
+                SchemaEntry entry = schemaEntries.get(key);
+                if (entry != null) {
+                    updateSchemaEntrySQL(entry, oldName, newName);
+                    rewriteSchemaEntry(key, newName.toLowerCase(), entry);
+                }
+
+                table.name = newName;
+                tables.remove(key);
+                tables.put(newName.toLowerCase(), table);
+
+                for (IndexInfo idx : indexes.values()) {
+                    if (idx.tableName.equalsIgnoreCase(oldName)) {
+                        idx.tableName = newName;
+                    }
+                }
+
+                pager.setSchemaCookie(pager.getSchemaCookie() + 1);
+                updatePage1Header();
+                pager.commit();
+                schemaCookie = pager.getSchemaCookie();
+            } catch (IOException e) {
+                try { pager.rollback(); } catch (IOException ignored) {}
+                throw new SQLException("Failed to rename table: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    public void alterTableRenameColumn(String tableName, String oldCol, String newCol) throws SQLException {
+        synchronized (lock) {
+            try {
+                String key = tableName.toLowerCase();
+                TableInfo table = tables.get(key);
+                if (table == null) throw new SQLException("no such table: " + tableName);
+
+                ColumnInfo col = null;
+                for (ColumnInfo ci : table.columns) {
+                    if (ci.name.equalsIgnoreCase(oldCol)) { col = ci; break; }
+                }
+                if (col == null) throw new SQLException("no such column: " + oldCol);
+                if (table.getColumnIndex(newCol) >= 0) throw new SQLException("duplicate column name: " + newCol);
+
+                col.name = newCol;
+
+                SchemaEntry entry = schemaEntries.get(key);
+                if (entry != null) {
+                    entry.sql = entry.sql.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(oldCol) + "\\b", newCol);
+                    rewriteSchemaEntry(key, key, entry);
+                }
+
+                pager.setSchemaCookie(pager.getSchemaCookie() + 1);
+                updatePage1Header();
+                pager.commit();
+                schemaCookie = pager.getSchemaCookie();
+            } catch (IOException e) {
+                try { pager.rollback(); } catch (IOException ignored) {}
+                throw new SQLException("Failed to rename column: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    public void alterTableAddColumn(String tableName, ColumnDefinition colDef) throws SQLException {
+        synchronized (lock) {
+            try {
+                String key = tableName.toLowerCase();
+                TableInfo table = tables.get(key);
+                if (table == null) throw new SQLException("no such table: " + tableName);
+
+                String colName = colDef.name;
+                if (table.getColumnIndex(colName) >= 0) throw new SQLException("duplicate column name: " + colName);
+
+                ColumnInfo ci = new ColumnInfo();
+                ci.name = colName;
+                ci.type = colDef.typeName != null ? colDef.typeName.name : "";
+                ci.cid = table.columns.size();
+                if (colDef.constraints != null) {
+                    for (ColumnConstraint cc : colDef.constraints) {
+                        if (cc instanceof Constraints.NotNullConstraint) ci.notNull = true;
+                        else if (cc instanceof Constraints.DefaultColumnConstraint) {
+                            ci.defaultValue = ((Constraints.DefaultColumnConstraint) cc).expression != null
+                                ? ((Constraints.DefaultColumnConstraint) cc).expression.toString() : null;
+                        }
+                    }
+                }
+                table.columns.add(ci);
+
+                SchemaEntry entry = schemaEntries.get(key);
+                if (entry != null) {
+                    StringBuilder sqlBuf = new StringBuilder(entry.sql);
+                    int parenIdx = sqlBuf.lastIndexOf(")");
+                    if (parenIdx >= 0) {
+                        sqlBuf.insert(parenIdx, ", " + quoteIdentifier(colName));
+                        if (colDef.typeName != null) sqlBuf.insert(parenIdx, " " + colDef.typeName.name);
+                    }
+                    entry.sql = sqlBuf.toString();
+                    rewriteSchemaEntry(key, key, entry);
+                }
+
+                pager.setSchemaCookie(pager.getSchemaCookie() + 1);
+                updatePage1Header();
+                pager.commit();
+                schemaCookie = pager.getSchemaCookie();
+            } catch (IOException e) {
+                try { pager.rollback(); } catch (IOException ignored) {}
+                throw new SQLException("Failed to add column: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    public void alterTableDropColumn(String tableName, String colName) throws SQLException {
+        synchronized (lock) {
+            try {
+                String key = tableName.toLowerCase();
+                TableInfo table = tables.get(key);
+                if (table == null) throw new SQLException("no such table: " + tableName);
+
+                int colIdx = table.getColumnIndex(colName);
+                if (colIdx < 0) throw new SQLException("no such column: " + colName);
+                if (table.columns.size() <= 1) throw new SQLException("cannot drop column: at least one column is required");
+
+                ColumnInfo ci = table.columns.get(colIdx);
+                if (ci.primaryKey) throw new SQLException("cannot drop column: " + colName + " (PRIMARY KEY)");
+
+                table.columns.remove(colIdx);
+
+                for (ForeignKeyInfo fk : table.foreignKeys) {
+                    if (fk.columns != null) {
+                        for (String fc : fk.columns) {
+                            if (fc.equalsIgnoreCase(colName)) throw new SQLException("cannot drop column referenced by FOREIGN KEY");
+                        }
+                    }
+                }
+
+                SchemaEntry entry = schemaEntries.get(key);
+                if (entry != null) {
+                    String sql = entry.sql;
+                    String pattern = "(?i),\\s*" + java.util.regex.Pattern.quote(colName) + "\\s+[^,)]+(?=[,)])";
+                    String updated = sql.replaceAll(pattern, "");
+                    if (updated.equals(sql)) {
+                        String pattern2 = "(?i)" + java.util.regex.Pattern.quote(colName) + "\\s+[^,)]+,\\s*";
+                        updated = sql.replaceFirst(pattern2, "");
+                    }
+                    entry.sql = updated;
+                    rewriteSchemaEntry(key, key, entry);
+                }
+
+                pager.setSchemaCookie(pager.getSchemaCookie() + 1);
+                updatePage1Header();
+                pager.commit();
+                schemaCookie = pager.getSchemaCookie();
+            } catch (IOException e) {
+                try { pager.rollback(); } catch (IOException ignored) {}
+                throw new SQLException("Failed to drop column: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    private void updateSchemaEntrySQL(SchemaEntry entry, String oldName, String newName) {
+        entry.sql = entry.sql.replaceAll("(?i)\\bTABLE\\s+" + java.util.regex.Pattern.quote(oldName) + "\\b", "TABLE " + newName);
+        entry.name = newName;
+        entry.tblName = newName;
+    }
+
+    private void rewriteSchemaEntry(String oldKey, String newKey, SchemaEntry entry) throws IOException {
+        CellLocation loc = findSchemaEntry(oldKey);
+        if (loc != null) {
+            btree.delete(1, loc.rowid);
+            Record rec = new Record();
+            rec.addValue(SQLiteValue.fromText(entry.type));
+            rec.addValue(SQLiteValue.fromText(entry.name));
+            rec.addValue(SQLiteValue.fromText(entry.tblName));
+            rec.addValue(SQLiteValue.fromLong(entry.rootpage));
+            rec.addValue(SQLiteValue.fromText(entry.sql));
+            long rowid = btree.nextRowid(1);
+            btree.insert(1, rowid, rec);
+        }
+        schemaEntries.remove(oldKey);
+        schemaEntries.put(newKey, entry);
+    }
+
     public void dropIndex(String indexName) throws SQLException {
         synchronized (lock) {
             try {
@@ -557,6 +761,7 @@ public class Database implements AutoCloseable {
                 }
 
                 checkUniqueConstraints(tableName, rowValues, -1);
+                checkForeignKeyChildConstraints(tableName, rowValues);
 
                 pager.beginTransaction();
                 btree.insert(table.rootPage, rowid, record);
@@ -600,6 +805,7 @@ public class Database implements AutoCloseable {
                     }
 
                     checkUniqueConstraints(tableName, rowValues, rwr.rowid);
+                    checkForeignKeyChildConstraints(tableName, rowValues);
 
                     btree.delete(table.rootPage, rwr.rowid);
                     btree.insert(table.rootPage, rwr.rowid, newRecord);
@@ -629,6 +835,7 @@ public class Database implements AutoCloseable {
 
                 pager.beginTransaction();
                 for (BTree.RecordWithRowid rwr : rows) {
+                    checkForeignKeyParentConstraints(tableName, rwr.rowid);
                     btree.delete(table.rootPage, rwr.rowid);
                     deleteFromIndexes(table, rwr.rowid);
                     deleted++;
@@ -728,6 +935,142 @@ public class Database implements AutoCloseable {
         }
     }
 
+    // ==================== Foreign Key Enforcement ====================
+
+    private void checkForeignKeyChildConstraints(String tableName, SQLiteValue[] rowValues) throws SQLException, IOException {
+        TableInfo table = tables.get(tableName.toLowerCase());
+        if (table == null || table.foreignKeys == null) return;
+
+        for (ForeignKeyInfo fk : table.foreignKeys) {
+            if (fk.columns == null || fk.columns.isEmpty()) continue;
+
+            TableInfo parentTable = tables.get(fk.foreignTable.toLowerCase());
+            if (parentTable == null) continue;
+
+            List<SQLiteValue> fkValues = new ArrayList<>();
+            boolean allNull = true;
+            for (String col : fk.columns) {
+                int colIdx = table.getColumnIndex(col);
+                SQLiteValue val = colIdx >= 0 && colIdx < rowValues.length ? rowValues[colIdx] : SQLiteValue.fromNull();
+                fkValues.add(val);
+                if (!val.isNull()) allNull = false;
+            }
+            if (allNull) continue;
+
+            List<String> parentCols = fk.foreignColumns;
+            if (parentCols == null || parentCols.isEmpty()) {
+                if (parentTable.columns != null) {
+                    for (ColumnInfo ci : parentTable.columns) {
+                        if (ci.primaryKey) {
+                            parentCols = java.util.Collections.singletonList(ci.name);
+                            break;
+                        }
+                    }
+                }
+                if (parentCols == null || parentCols.isEmpty()) {
+                    parentCols = java.util.Collections.singletonList("rowid");
+                }
+            }
+
+            List<BTree.RecordWithRowid> parentRows = btree.scanTable(parentTable.rootPage);
+            int pkColIndex = -1;
+            for (int i = 0; i < parentTable.columns.size(); i++) {
+                ColumnInfo ci = parentTable.columns.get(i);
+                if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) { pkColIndex = i; break; }
+            }
+
+            boolean found = false;
+            for (BTree.RecordWithRowid pr : parentRows) {
+                boolean match = true;
+                for (int i = 0; i < parentCols.size(); i++) {
+                    int parentColIdx = parentTable.getColumnIndex(parentCols.get(i));
+                    SQLiteValue parentVal;
+                    if (parentColIdx == pkColIndex) {
+                        parentVal = SQLiteValue.fromLong(pr.rowid);
+                    } else if (pkColIndex >= 0 && parentColIdx > pkColIndex) {
+                        parentVal = pr.record.getValue(parentColIdx - 1);
+                    } else {
+                        parentVal = pr.record.getValue(parentColIdx);
+                    }
+                    SQLiteValue childVal = fkValues.get(i);
+                    if (childVal.isNull() || parentVal.isNull()) { match = false; break; }
+                    if (!childVal.equals(parentVal)) { match = false; break; }
+                }
+                if (match) { found = true; break; }
+            }
+            if (!found) {
+                throw new SQLException("FOREIGN KEY constraint failed");
+            }
+        }
+    }
+
+    private void checkForeignKeyParentConstraints(String parentTableName, long deletedRowid) throws SQLException, IOException {
+        TableInfo parentTable = tables.get(parentTableName.toLowerCase());
+        if (parentTable == null) return;
+
+        int pkColIndex = -1;
+        for (int i = 0; i < parentTable.columns.size(); i++) {
+            ColumnInfo ci = parentTable.columns.get(i);
+            if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) { pkColIndex = i; break; }
+        }
+
+        for (TableInfo childTable : tables.values()) {
+            if (childTable.foreignKeys == null) continue;
+            for (ForeignKeyInfo fk : childTable.foreignKeys) {
+                if (!fk.foreignTable.equalsIgnoreCase(parentTableName)) continue;
+                if (fk.columns == null || fk.columns.isEmpty()) continue;
+
+                List<String> parentCols = fk.foreignColumns;
+                if (parentCols == null || parentCols.isEmpty()) {
+                    for (ColumnInfo ci : parentTable.columns) {
+                        if (ci.primaryKey) {
+                            parentCols = java.util.Collections.singletonList(ci.name);
+                            break;
+                        }
+                    }
+                    if (parentCols == null || parentCols.isEmpty()) {
+                        parentCols = java.util.Collections.singletonList("rowid");
+                    }
+                }
+
+                List<BTree.RecordWithRowid> childRows = btree.scanTable(childTable.rootPage);
+                int childPkColIndex = -1;
+                for (int i = 0; i < childTable.columns.size(); i++) {
+                    ColumnInfo ci = childTable.columns.get(i);
+                    if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) { childPkColIndex = i; break; }
+                }
+
+                for (BTree.RecordWithRowid cr : childRows) {
+                    boolean match = true;
+                    for (int i = 0; i < fk.columns.size(); i++) {
+                        int childColIdx = childTable.getColumnIndex(fk.columns.get(i));
+                        SQLiteValue childVal;
+                        if (childColIdx == childPkColIndex) {
+                            childVal = SQLiteValue.fromLong(cr.rowid);
+                        } else if (childPkColIndex >= 0 && childColIdx > childPkColIndex) {
+                            childVal = cr.record.getValue(childColIdx - 1);
+                        } else {
+                            childVal = cr.record.getValue(childColIdx);
+                        }
+
+                        int parentColIdx = parentTable.getColumnIndex(parentCols.get(i));
+                        if (parentColIdx == pkColIndex) {
+                            if (!childVal.equals(SQLiteValue.fromLong(deletedRowid))) { match = false; break; }
+                        } else {
+                            if (childVal.isNull()) { match = false; break; }
+                        }
+                    }
+                    if (match) {
+                        if (fk.onDelete == Enums.ForeignKeyAction.CASCADE) continue;
+                        if (fk.onDelete == Enums.ForeignKeyAction.SET_NULL) continue;
+                        if (fk.onDelete == Enums.ForeignKeyAction.SET_DEFAULT) continue;
+                        throw new SQLException("FOREIGN KEY constraint failed");
+                    }
+                }
+            }
+        }
+    }
+
     // ==================== Transaction Management ====================
 
     public void beginTransaction() throws SQLException {
@@ -805,10 +1148,11 @@ public class Database implements AutoCloseable {
         sb.append(quoteIdentifier(stmt.tableName));
         sb.append(" (");
 
+        boolean first = true;
         if (stmt.columns != null) {
-            for (int i = 0; i < stmt.columns.size(); i++) {
-                if (i > 0) sb.append(", ");
-                ColumnDefinition col = stmt.columns.get(i);
+            for (ColumnDefinition col : stmt.columns) {
+                if (!first) sb.append(", ");
+                first = false;
                 sb.append(quoteIdentifier(col.name));
                 if (col.typeName != null) {
                     sb.append(" ").append(col.typeName.name);
@@ -826,13 +1170,82 @@ public class Database implements AutoCloseable {
                         } else if (cc instanceof Constraints.DefaultColumnConstraint) {
                             sb.append("DEFAULT ");
                             sb.append(((Constraints.DefaultColumnConstraint) cc).expression);
+                        } else if (cc instanceof Constraints.ForeignKeyColumnConstraint) {
+                            Constraints.ForeignKeyColumnConstraint fk = (Constraints.ForeignKeyColumnConstraint) cc;
+                            sb.append("REFERENCES ").append(quoteIdentifier(fk.foreignTable));
+                            if (fk.foreignColumns != null && !fk.foreignColumns.isEmpty()) {
+                                sb.append("(");
+                                for (int i = 0; i < fk.foreignColumns.size(); i++) {
+                                    if (i > 0) sb.append(", ");
+                                    sb.append(quoteIdentifier(fk.foreignColumns.get(i)));
+                                }
+                                sb.append(")");
+                            }
+                            appendFkActions(sb, fk.onDelete, fk.onUpdate);
                         }
                     }
                 }
             }
         }
+        if (stmt.constraints != null) {
+            for (TableConstraint tc : stmt.constraints) {
+                if (!first) sb.append(", ");
+                first = false;
+                if (tc instanceof TableConstraint.PrimaryKey) {
+                    TableConstraint.PrimaryKey pk = (TableConstraint.PrimaryKey) tc;
+                    sb.append("PRIMARY KEY (");
+                    for (int i = 0; i < pk.columns.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(pk.columns.get(i).expression);
+                    }
+                    sb.append(")");
+                } else if (tc instanceof TableConstraint.Unique) {
+                    TableConstraint.Unique u = (TableConstraint.Unique) tc;
+                    sb.append("UNIQUE (");
+                    for (int i = 0; i < u.columns.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(u.columns.get(i).expression);
+                    }
+                    sb.append(")");
+                } else if (tc instanceof TableConstraint.ForeignKey) {
+                    TableConstraint.ForeignKey fk = (TableConstraint.ForeignKey) tc;
+                    sb.append("FOREIGN KEY (");
+                    for (int i = 0; i < fk.columns.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(quoteIdentifier(fk.columns.get(i)));
+                    }
+                    sb.append(") REFERENCES ").append(quoteIdentifier(fk.foreignTable));
+                    if (fk.foreignColumns != null && !fk.foreignColumns.isEmpty()) {
+                        sb.append("(");
+                        for (int i = 0; i < fk.foreignColumns.size(); i++) {
+                            if (i > 0) sb.append(", ");
+                            sb.append(quoteIdentifier(fk.foreignColumns.get(i)));
+                        }
+                        sb.append(")");
+                    }
+                    appendFkActions(sb, fk.onDelete, fk.onUpdate);
+                }
+            }
+        }
         sb.append(")");
         return sb.toString();
+    }
+
+    private void appendFkActions(StringBuilder sb, Enums.ForeignKeyAction onDelete, Enums.ForeignKeyAction onUpdate) {
+        if (onDelete != null && onDelete != Enums.ForeignKeyAction.NO_ACTION) {
+            sb.append(" ON DELETE ");
+            if (onDelete == Enums.ForeignKeyAction.CASCADE) sb.append("CASCADE");
+            else if (onDelete == Enums.ForeignKeyAction.SET_NULL) sb.append("SET NULL");
+            else if (onDelete == Enums.ForeignKeyAction.SET_DEFAULT) sb.append("SET DEFAULT");
+            else if (onDelete == Enums.ForeignKeyAction.RESTRICT) sb.append("RESTRICT");
+        }
+        if (onUpdate != null && onUpdate != Enums.ForeignKeyAction.NO_ACTION) {
+            sb.append(" ON UPDATE ");
+            if (onUpdate == Enums.ForeignKeyAction.CASCADE) sb.append("CASCADE");
+            else if (onUpdate == Enums.ForeignKeyAction.SET_NULL) sb.append("SET NULL");
+            else if (onUpdate == Enums.ForeignKeyAction.SET_DEFAULT) sb.append("SET DEFAULT");
+            else if (onUpdate == Enums.ForeignKeyAction.RESTRICT) sb.append("RESTRICT");
+        }
     }
 
     private String reconstructCreateIndexSQL(CreateIndexStatement stmt) {
