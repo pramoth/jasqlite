@@ -344,31 +344,63 @@ public class Database implements AutoCloseable {
                 indexes.put(stmt.indexName.toLowerCase(), info);
                 schemaCookie = pager.getSchemaCookie();
 
-            } catch (IOException e) {
+            } catch (Exception e) {
                 try { pager.rollback(); } catch (IOException ignored) {}
+                if (e instanceof SQLException) throw (SQLException) e;
                 throw new SQLException("Failed to create index: " + e.getMessage(), e);
             }
         }
     }
 
-    private void populateIndex(TableInfo table, CreateIndexStatement stmt, int rootPage) throws IOException {
+    private void populateIndex(TableInfo table, CreateIndexStatement stmt, int rootPage) throws IOException, SQLException {
         List<BTree.RecordWithRowid> rows = btree.scanTable(table.rootPage);
-        for (BTree.RecordWithRowid rwr : rows) {
-            Record keyRecord = new Record();
-            if (stmt.columns != null) {
-                for (IndexedColumn ic : stmt.columns) {
-                    if (ic.expression instanceof Expressions.ColumnRef) {
-                        String colName = ((Expressions.ColumnRef) ic.expression).columnName;
-                        int idx = table.getColumnIndex(colName);
-                        if (idx >= 0) {
-                            keyRecord.addValue(rwr.record.getValue(idx));
-                        }
-                    }
+        if (stmt.unique) {
+            java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+            for (BTree.RecordWithRowid rwr : rows) {
+                Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
+                String keyStr = keyRecord.serialize() != null ? java.util.Arrays.toString(keyRecord.serialize()) : "";
+                if (!seen.add(keyStr)) {
+                    throw new SQLException("UNIQUE constraint failed: " + stmt.indexName);
                 }
             }
+        }
+        for (BTree.RecordWithRowid rwr : rows) {
+            Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
             keyRecord.addValue(SQLiteValue.fromLong(rwr.rowid));
             btree.insertIndex(rootPage, keyRecord.serialize());
         }
+    }
+
+    private Record buildIndexKeyFromRecord(TableInfo table, CreateIndexStatement stmt, BTree.RecordWithRowid rwr) {
+        int pkColIndex = -1;
+        for (int i = 0; i < table.columns.size(); i++) {
+            ColumnInfo ci = table.columns.get(i);
+            if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) {
+                pkColIndex = i;
+                break;
+            }
+        }
+
+        Record keyRecord = new Record();
+        if (stmt.columns != null) {
+            for (IndexedColumn ic : stmt.columns) {
+                if (ic.expression instanceof Expressions.ColumnRef) {
+                    String colName = ((Expressions.ColumnRef) ic.expression).columnName;
+                    int logicalIdx = table.getColumnIndex(colName);
+                    if (logicalIdx >= 0) {
+                        int recordIdx = logicalIdx;
+                        if (pkColIndex >= 0 && logicalIdx > pkColIndex) {
+                            recordIdx--;
+                        } else if (pkColIndex >= 0 && logicalIdx == pkColIndex) {
+                            keyRecord.addValue(SQLiteValue.fromLong(rwr.rowid));
+                            continue;
+                        }
+                        keyRecord.addValue(rwr.record.getValue(recordIdx));
+                    }
+                }
+            }
+        }
+        return keyRecord;
     }
 
     public void dropTable(String tableName) throws SQLException {
@@ -524,8 +556,11 @@ public class Database implements AutoCloseable {
                     rowid = btree.nextRowid(table.rootPage);
                 }
 
+                checkUniqueConstraints(tableName, rowValues, -1);
+
                 pager.beginTransaction();
                 btree.insert(table.rootPage, rowid, record);
+                insertIntoIndexes(table, rowValues, rowid);
                 lastInsertRowid = rowid;
                 changesCount++;
                 pager.commit();
@@ -550,22 +585,26 @@ public class Database implements AutoCloseable {
                 pager.beginTransaction();
 
                 for (BTree.RecordWithRowid rwr : rows) {
-                    // TODO: evaluate WHERE clause
-                    // For now, update all rows if no where clause
                     Record newRecord = new Record();
                     List<ColumnInfo> tableCols = table.columns;
 
+                    SQLiteValue[] rowValues = new SQLiteValue[tableCols.size()];
                     for (int i = 0; i < tableCols.size(); i++) {
                         int updateIdx = columns != null ? columns.indexOf(tableCols.get(i).name) : -1;
                         if (updateIdx >= 0 && updateIdx < values.size()) {
-                            newRecord.addValue(values.get(updateIdx));
+                            rowValues[i] = values.get(updateIdx);
                         } else {
-                            newRecord.addValue(rwr.record.getValue(i));
+                            rowValues[i] = rwr.record.getValue(i);
                         }
+                        newRecord.addValue(rowValues[i]);
                     }
+
+                    checkUniqueConstraints(tableName, rowValues, rwr.rowid);
 
                     btree.delete(table.rootPage, rwr.rowid);
                     btree.insert(table.rootPage, rwr.rowid, newRecord);
+                    deleteFromIndexes(table, rwr.rowid);
+                    insertIntoIndexes(table, rowValues, rwr.rowid);
                     updated++;
                 }
 
@@ -590,8 +629,8 @@ public class Database implements AutoCloseable {
 
                 pager.beginTransaction();
                 for (BTree.RecordWithRowid rwr : rows) {
-                    // TODO: evaluate WHERE clause
                     btree.delete(table.rootPage, rwr.rowid);
+                    deleteFromIndexes(table, rwr.rowid);
                     deleted++;
                 }
 
@@ -601,6 +640,90 @@ public class Database implements AutoCloseable {
             } catch (IOException e) {
                 try { pager.rollback(); } catch (IOException ignored) {}
                 throw new SQLException("Delete failed: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    // ==================== Index Maintenance ====================
+
+    private void insertIntoIndexes(TableInfo table, SQLiteValue[] rowValues, long rowid) throws IOException {
+        for (IndexInfo idx : indexes.values()) {
+            if (!idx.tableName.equalsIgnoreCase(table.name)) continue;
+            if (idx.columns == null || idx.columns.isEmpty()) continue;
+
+            Record keyRecord = new Record();
+            for (String idxCol : idx.columns) {
+                int colIdx = table.getColumnIndex(idxCol);
+                if (colIdx >= 0 && colIdx < rowValues.length) {
+                    keyRecord.addValue(rowValues[colIdx]);
+                } else {
+                    keyRecord.addValue(SQLiteValue.fromNull());
+                }
+            }
+            keyRecord.addValue(SQLiteValue.fromLong(rowid));
+            btree.insertIndex(idx.rootPage, keyRecord.serialize());
+        }
+    }
+
+    private void deleteFromIndexes(TableInfo table, long rowid) throws IOException {
+        for (IndexInfo idx : indexes.values()) {
+            if (!idx.tableName.equalsIgnoreCase(table.name)) continue;
+            if (idx.columns == null || idx.columns.isEmpty()) continue;
+
+            List<byte[]> entries = btree.scanIndex(idx.rootPage);
+            List<byte[]> kept = new ArrayList<>();
+            for (byte[] entry : entries) {
+                Record rec = Record.deserialize(entry, 0).record;
+                long entryRowid = rec.getValue(rec.getColumnCount() - 1).asLong();
+                if (entryRowid != rowid) {
+                    kept.add(entry);
+                }
+            }
+            if (kept.size() < entries.size()) {
+                btree.rebuildIndex(idx.rootPage, kept);
+            }
+        }
+    }
+
+    // ==================== Unique Constraint Enforcement ====================
+
+    private void checkUniqueConstraints(String tableName, SQLiteValue[] rowValues, long excludeRowid) throws SQLException, IOException {
+        for (IndexInfo idx : indexes.values()) {
+            if (!idx.unique) continue;
+            if (!idx.tableName.equalsIgnoreCase(tableName)) continue;
+            if (idx.columns == null || idx.columns.isEmpty()) continue;
+
+            TableInfo table = tables.get(tableName.toLowerCase());
+            if (table == null) continue;
+
+            Record keyRecord = new Record();
+            for (String idxCol : idx.columns) {
+                int colIdx = table.getColumnIndex(idxCol);
+                if (colIdx >= 0 && colIdx < rowValues.length) {
+                    keyRecord.addValue(rowValues[colIdx]);
+                } else {
+                    keyRecord.addValue(SQLiteValue.fromNull());
+                }
+            }
+
+            List<byte[]> indexEntries = btree.scanIndex(idx.rootPage);
+            for (byte[] entry : indexEntries) {
+                Record rec = Record.deserialize(entry, 0).record;
+                if (rec.getColumnCount() < keyRecord.getColumnCount()) continue;
+
+                long entryRowid = rec.getValue(rec.getColumnCount() - 1).asLong();
+                if (entryRowid == excludeRowid) continue;
+
+                boolean match = true;
+                for (int i = 0; i < keyRecord.getColumnCount(); i++) {
+                    SQLiteValue a = keyRecord.getValue(i);
+                    SQLiteValue b = rec.getValue(i);
+                    if (a.isNull() || b.isNull()) { match = false; break; }
+                    if (!a.equals(b)) { match = false; break; }
+                }
+                if (match) {
+                    throw new SQLException("UNIQUE constraint failed: " + idx.name);
+                }
             }
         }
     }

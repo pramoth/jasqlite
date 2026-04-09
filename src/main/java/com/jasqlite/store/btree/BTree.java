@@ -142,6 +142,14 @@ public class BTree {
         insertIndexCell(rootPage, keyPayload);
     }
 
+    public void rebuildIndex(int rootPage, List<byte[]> entries) throws IOException {
+        Page root = pager.getPageForWrite(rootPage);
+        root.initAsLeafIndex();
+        for (byte[] entry : entries) {
+            insertIndexCell(rootPage, entry);
+        }
+    }
+
     /**
      * Delete a row from a table B-tree by rowid.
      */

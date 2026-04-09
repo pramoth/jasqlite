@@ -808,4 +808,101 @@ class JaSQLiteTest {
             assertTrue(detail.contains("SCAN TABLE users"), "Expected SCAN TABLE users, got: " + detail);
         }
     }
+
+    // ==================== UNIQUE Constraint Tests ====================
+
+    @Test
+    void testUniqueIndexRejectsDuplicateOnInsert() throws Exception {
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)");
+        db.execute("CREATE UNIQUE INDEX idx_email ON users (email)");
+        db.execute("INSERT INTO users (email) VALUES ('alice@test.com')");
+
+        SQLException ex = assertThrows(SQLException.class, () ->
+            db.execute("INSERT INTO users (email) VALUES ('alice@test.com')"));
+        assertTrue(ex.getMessage().contains("UNIQUE constraint failed"),
+            "Expected UNIQUE constraint failed, got: " + ex.getMessage());
+    }
+
+    @Test
+    void testUniqueIndexAllowsDifferentValues() throws Exception {
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)");
+        db.execute("CREATE UNIQUE INDEX idx_email ON users (email)");
+        db.execute("INSERT INTO users (email) VALUES ('alice@test.com')");
+        db.execute("INSERT INTO users (email) VALUES ('bob@test.com')");
+
+        Result result = db.execute("SELECT email FROM users ORDER BY email");
+        assertEquals(2, result.getRowCount());
+        assertEquals("alice@test.com", result.getValue(0, 0).asString());
+        assertEquals("bob@test.com", result.getValue(1, 0).asString());
+    }
+
+    @Test
+    void testUniqueIndexRejectsDuplicateOnCreate() throws Exception {
+        db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT)");
+        db.execute("INSERT INTO products (sku) VALUES ('ABC')");
+        db.execute("INSERT INTO products (sku) VALUES ('ABC')");
+
+        SQLException ex = assertThrows(SQLException.class, () ->
+            db.execute("CREATE UNIQUE INDEX idx_sku ON products (sku)"));
+        assertTrue(ex.getMessage().contains("UNIQUE constraint failed"),
+            "Expected UNIQUE constraint failed, got: " + ex.getMessage());
+    }
+
+    @Test
+    void testUniqueCompositeIndexRejectsDuplicate() throws Exception {
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, order_num INTEGER)");
+        db.execute("CREATE UNIQUE INDEX idx_cust_order ON orders (customer_id, order_num)");
+        db.execute("INSERT INTO orders (customer_id, order_num) VALUES (1, 100)");
+
+        SQLException ex = assertThrows(SQLException.class, () ->
+            db.execute("INSERT INTO orders (customer_id, order_num) VALUES (1, 100)"));
+        assertTrue(ex.getMessage().contains("UNIQUE constraint failed"),
+            "Expected UNIQUE constraint failed, got: " + ex.getMessage());
+    }
+
+    @Test
+    void testUniqueCompositeIndexAllowsPartialOverlap() throws Exception {
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, order_num INTEGER)");
+        db.execute("CREATE UNIQUE INDEX idx_cust_order ON orders (customer_id, order_num)");
+        db.execute("INSERT INTO orders (customer_id, order_num) VALUES (1, 100)");
+        db.execute("INSERT INTO orders (customer_id, order_num) VALUES (1, 101)");
+        db.execute("INSERT INTO orders (customer_id, order_num) VALUES (2, 100)");
+
+        Result result = db.execute("SELECT customer_id, order_num FROM orders ORDER BY id");
+        assertEquals(3, result.getRowCount());
+        assertEquals(1, result.getValue(0, 0).asLong());
+        assertEquals(100, result.getValue(0, 1).asLong());
+        assertEquals(1, result.getValue(1, 0).asLong());
+        assertEquals(101, result.getValue(1, 1).asLong());
+        assertEquals(2, result.getValue(2, 0).asLong());
+        assertEquals(100, result.getValue(2, 1).asLong());
+    }
+
+    @Test
+    void testUniqueIndexAllowsNullDuplicates() throws Exception {
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)");
+        db.execute("CREATE UNIQUE INDEX idx_email ON users (email)");
+        db.execute("INSERT INTO users (email) VALUES (NULL)");
+        db.execute("INSERT INTO users (email) VALUES (NULL)");
+
+        Result result = db.execute("SELECT id FROM users ORDER BY id");
+        assertEquals(2, result.getRowCount());
+    }
+
+    @Test
+    void testUniqueConstraintViaJdbc() throws Exception {
+        String path = tempDir.resolve("test-unique-jdbc.db").toString();
+        new File(path).delete();
+
+        try (Connection conn = DriverManager.getConnection("jdbc:jasqlite:" + path)) {
+            Statement stmt = conn.createStatement();
+            stmt.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, username TEXT)");
+            stmt.execute("CREATE UNIQUE INDEX idx_username ON accounts (username)");
+            stmt.executeUpdate("INSERT INTO accounts (username) VALUES ('alice')");
+
+            SQLException ex = assertThrows(SQLException.class, () ->
+                stmt.executeUpdate("INSERT INTO accounts (username) VALUES ('alice')"));
+            assertTrue(ex.getMessage().contains("UNIQUE constraint failed"));
+        }
+    }
 }

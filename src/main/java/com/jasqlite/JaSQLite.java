@@ -115,25 +115,7 @@ public class JaSQLite {
                 try (Statement stmt = conn.createStatement()) {
                     if (stmt.execute(line)) {
                         java.sql.ResultSet rs = stmt.getResultSet();
-                        int cols = rs.getMetaData().getColumnCount();
-                        StringBuilder header = new StringBuilder();
-                        StringBuilder separator = new StringBuilder();
-                        for (int i = 1; i <= cols; i++) {
-                            if (i > 1) { header.append("|"); separator.append("-"); }
-                            String name = rs.getMetaData().getColumnName(i);
-                            header.append(name);
-                            for (int j = 0; j < name.length(); j++) separator.append("-");
-                        }
-                        System.out.println(header);
-                        System.out.println(separator);
-                        while (rs.next()) {
-                            StringBuilder row = new StringBuilder();
-                            for (int i = 1; i <= cols; i++) {
-                                if (i > 1) row.append("|");
-                                row.append(rs.getString(i) != null ? rs.getString(i) : "NULL");
-                            }
-                            System.out.println(row);
-                        }
+                        printResultSet(rs);
                     } else {
                         System.out.println("Changes: " + stmt.getUpdateCount());
                     }
@@ -154,6 +136,85 @@ public class JaSQLite {
     private static final int PROMPT_LEN = PROMPT.length();
     private static final Path HISTORY_FILE = Paths.get(System.getProperty("user.home"), ".sql_history");
     private static final int MAX_HISTORY = 1000;
+
+    private static void printResultSet(java.sql.ResultSet rs) throws SQLException {
+        int cols = rs.getMetaData().getColumnCount();
+        String[] colNames = new String[cols];
+        for (int i = 0; i < cols; i++) {
+            colNames[i] = rs.getMetaData().getColumnName(i + 1);
+        }
+
+        List<String[]> rows = new ArrayList<>();
+        while (rs.next()) {
+            String[] row = new String[cols];
+            for (int i = 0; i < cols; i++) {
+                String val = rs.getString(i + 1);
+                row[i] = val != null ? val : "";
+            }
+            rows.add(row);
+        }
+
+        int[] widths = new int[cols];
+        for (int i = 0; i < cols; i++) {
+            widths[i] = displayWidth(colNames[i]);
+        }
+        for (String[] row : rows) {
+            for (int i = 0; i < cols; i++) {
+                widths[i] = Math.max(widths[i], displayWidth(row[i]));
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(' ');
+        for (int i = 0; i < cols; i++) {
+            if (i > 0) sb.append(" | ");
+            pad(sb, colNames[i], widths[i]);
+        }
+        System.out.println(sb);
+
+        sb.setLength(0);
+        sb.append('-');
+        for (int i = 0; i < cols; i++) {
+            if (i > 0) sb.append("-+-");
+            sb.append(repeat('-', widths[i]));
+        }
+        sb.append('-');
+        System.out.println(sb);
+
+        for (String[] row : rows) {
+            sb.setLength(0);
+            sb.append(' ');
+            for (int i = 0; i < cols; i++) {
+                if (i > 0) sb.append(" | ");
+                pad(sb, row[i], widths[i]);
+            }
+            System.out.println(sb);
+        }
+
+        System.out.println("(" + rows.size() + (rows.size() == 1 ? " row)" : " rows)"));
+    }
+
+    private static void pad(StringBuilder sb, String s, int width) {
+        int w = displayWidth(s);
+        sb.append(s);
+        for (int i = w; i < width; i++) sb.append(' ');
+    }
+
+    private static int displayWidth(String s) {
+        int w = 0;
+        for (int i = 0; i < s.length(); ) {
+            int cp = s.codePointAt(i);
+            i += Character.charCount(cp);
+            w++;
+        }
+        return w;
+    }
+
+    private static String repeat(char c, int count) {
+        char[] arr = new char[count];
+        java.util.Arrays.fill(arr, c);
+        return new String(arr);
+    }
 
     private static List<String> loadHistory() {
         List<String> history = new ArrayList<>();
