@@ -25,7 +25,7 @@ A SQLite-compatible SQL engine written entirely in Java. JaSQLite reads and writ
   - `CAST` expressions
 - `CREATE INDEX` / `DROP INDEX` (including `UNIQUE` indexes)
 - `CREATE VIEW` / `DROP VIEW`
-- `EXPLAIN` and `EXPLAIN QUERY PLAN`
+- `EXPLAIN` and `EXPLAIN QUERY PLAN` (with index usage reporting)
 - Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`
 - `PRAGMA` (read and write)
 - `ATTACH` / `DETACH` database
@@ -163,9 +163,24 @@ java -jar target/jasqlite-1.0.0.jar /path/to/my.db
 
 ### Usage — EXPLAIN QUERY PLAN
 ```java
-Result plan = db.execute("EXPLAIN QUERY PLAN SELECT e.name, d.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id");
-// Returns: selectid, order, from, detail columns
-// e.g. "SCAN TABLE employees AS e", "INNER JOIN SCAN TABLE departments AS d ON ..."
+// Without index — shows SCAN TABLE
+Result plan = db.execute("EXPLAIN QUERY PLAN SELECT * FROM users WHERE email = 'alice@test.com'");
+// detail: "SCAN TABLE users (~N rows)"
+
+// With index — shows SEARCH TABLE ... USING INDEX
+db.execute("CREATE INDEX idx_email ON users (email)");
+Result plan = db.execute("EXPLAIN QUERY PLAN SELECT * FROM users WHERE email = 'alice@test.com'");
+// detail: "SEARCH TABLE users USING INDEX idx_email (email=?)"
+
+// Composite index — matches on prefix columns
+db.execute("CREATE INDEX idx_cust_date ON orders (customer_id, order_date)");
+Result plan = db.execute("EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 1");
+// detail: "SEARCH TABLE orders USING INDEX idx_cust_date (customer_id=?)"
+
+// Joins — uses index from ON condition
+Result plan = db.execute(
+    "EXPLAIN QUERY PLAN SELECT e.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id");
+// detail: "SEARCH TABLE employees USING INDEX idx_dept (dept_id=?)"
 ```
 
 ## Architecture
@@ -178,7 +193,7 @@ JaSQLite implements the core components of a relational database engine:
 
 3. **SQL Parser** — Hand-written recursive descent parser covering the full SQLite SQL grammar. Produces an AST with typed expression nodes.
 
-4. **Query Planner** — Walks the AST and executes queries against the storage engine. Handles joins (via nested loop), aggregates, grouping, ordering, and filtering.
+4. **Query Planner** — Walks the AST and executes queries against the storage engine. Handles joins (via nested loop), aggregates, grouping, ordering, and filtering. `EXPLAIN QUERY PLAN` reports index usage via `SEARCH TABLE ... USING INDEX` when a matching index is found.
 
 5. **VDBE** — Virtual Database Engine with an opcode-based instruction set, modeled after SQLite's VDBE.
 
