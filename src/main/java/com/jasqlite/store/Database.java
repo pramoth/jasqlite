@@ -224,6 +224,10 @@ public class Database implements AutoCloseable {
                             info.descending.add(ic.order == Enums.OrderDirection.DESC);
                         }
                     }
+                    if (ci.where != null) {
+                        info.where = exprToSQL(ci.where);
+                        info.whereExpr = ci.where;
+                    }
                 }
             } catch (Exception ignored) {
             }
@@ -347,17 +351,11 @@ public class Database implements AutoCloseable {
                 SchemaEntry entry = new SchemaEntry("index", stmt.indexName, stmt.tableName, rootPage, sql);
                 schemaEntries.put(stmt.indexName.toLowerCase(), entry);
                 IndexInfo info = parseIndexInfo(entry);
-                if (stmt.columns != null) {
-                    for (IndexedColumn ic : stmt.columns) {
-                        if (ic.expression instanceof Expressions.ColumnRef) {
-                            info.columns.add(((Expressions.ColumnRef) ic.expression).columnName);
-                        } else if (ic.expression != null) {
-                            info.columns.add(ic.expression.toString());
-                        }
-                        info.descending.add(ic.order == Enums.OrderDirection.DESC);
-                    }
-                }
                 info.unique = stmt.unique;
+                if (stmt.where != null) {
+                    info.where = exprToSQL(stmt.where);
+                    info.whereExpr = stmt.where;
+                }
                 indexes.put(stmt.indexName.toLowerCase(), info);
                 schemaCookie = pager.getSchemaCookie();
 
@@ -371,9 +369,15 @@ public class Database implements AutoCloseable {
 
     private void populateIndex(TableInfo table, CreateIndexStatement stmt, int rootPage) throws IOException, SQLException {
         List<BTree.RecordWithRowid> rows = btree.scanTable(table.rootPage);
+        int pkColIndex = findPkColIndex(table);
+
         if (stmt.unique) {
             java.util.Set<String> seen = new java.util.LinkedHashSet<>();
             for (BTree.RecordWithRowid rwr : rows) {
+                if (stmt.where != null) {
+                    SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
+                    if (!matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
+                }
                 Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
                 String keyStr = keyRecord.serialize() != null ? java.util.Arrays.toString(keyRecord.serialize()) : "";
                 if (!seen.add(keyStr)) {
@@ -382,9 +386,55 @@ public class Database implements AutoCloseable {
             }
         }
         for (BTree.RecordWithRowid rwr : rows) {
+            if (stmt.where != null) {
+                SQLiteValue[] rowValues = buildRowValues(table, rwr, pkColIndex);
+                if (!matchesCreateIndexWhere(stmt, table, rowValues, rwr.rowid)) continue;
+            }
             Record keyRecord = buildIndexKeyFromRecord(table, stmt, rwr);
             keyRecord.addValue(SQLiteValue.fromLong(rwr.rowid));
             btree.insertIndex(rootPage, keyRecord.serialize());
+        }
+    }
+
+    private int findPkColIndex(TableInfo table) {
+        for (int i = 0; i < table.columns.size(); i++) {
+            ColumnInfo ci = table.columns.get(i);
+            if (ci.primaryKey && "INTEGER".equalsIgnoreCase(ci.type)) return i;
+        }
+        return -1;
+    }
+
+    private SQLiteValue[] buildRowValues(TableInfo table, BTree.RecordWithRowid rwr, int pkColIndex) {
+        SQLiteValue[] rowValues = new SQLiteValue[table.columns.size()];
+        for (int i = 0; i < table.columns.size(); i++) {
+            if (i == pkColIndex) {
+                rowValues[i] = SQLiteValue.fromLong(rwr.rowid);
+            } else {
+                int recIdx = i;
+                if (pkColIndex >= 0 && i > pkColIndex) recIdx--;
+                rowValues[i] = recIdx < rwr.record.getColumnCount() ? rwr.record.getValue(recIdx) : SQLiteValue.fromNull();
+            }
+        }
+        return rowValues;
+    }
+
+    private boolean matchesCreateIndexWhere(CreateIndexStatement stmt, TableInfo table, SQLiteValue[] rowValues, long rowid) {
+        if (stmt.where == null) return true;
+        QueryPlanner.TableRow tr = new QueryPlanner.TableRow();
+        tr.tableName = table.name;
+        tr.rowid = rowid;
+        tr.columnNames = new ArrayList<>();
+        tr.tableNames = new ArrayList<>();
+        tr.values = rowValues;
+        for (ColumnInfo ci : table.columns) {
+            tr.columnNames.add(ci.name);
+            tr.tableNames.add(table.name);
+        }
+        try {
+            SQLiteValue result = queryPlanner.evaluateExpression(stmt.where, tr, null);
+            return !result.isNull() && (result.asLong() != 0 || result.asDouble() != 0.0);
+        } catch (Exception e) {
+            return true;
         }
     }
 
@@ -853,10 +903,33 @@ public class Database implements AutoCloseable {
 
     // ==================== Index Maintenance ====================
 
+    private boolean matchesIndexWhere(IndexInfo idx, TableInfo table, SQLiteValue[] rowValues, long rowid) {
+        if (idx.whereExpr == null) return true;
+
+        QueryPlanner.TableRow tr = new QueryPlanner.TableRow();
+        tr.tableName = table.name;
+        tr.rowid = rowid;
+        tr.columnNames = new ArrayList<>();
+        tr.tableNames = new ArrayList<>();
+        tr.values = rowValues;
+        for (ColumnInfo ci : table.columns) {
+            tr.columnNames.add(ci.name);
+            tr.tableNames.add(table.name);
+        }
+
+        try {
+            SQLiteValue result = queryPlanner.evaluateExpression(idx.whereExpr, tr, null);
+            return !result.isNull() && (result.asLong() != 0 || result.asDouble() != 0.0);
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
     private void insertIntoIndexes(TableInfo table, SQLiteValue[] rowValues, long rowid) throws IOException {
         for (IndexInfo idx : indexes.values()) {
             if (!idx.tableName.equalsIgnoreCase(table.name)) continue;
             if (idx.columns == null || idx.columns.isEmpty()) continue;
+            if (!matchesIndexWhere(idx, table, rowValues, rowid)) continue;
 
             Record keyRecord = new Record();
             for (String idxCol : idx.columns) {
@@ -902,6 +975,8 @@ public class Database implements AutoCloseable {
 
             TableInfo table = tables.get(tableName.toLowerCase());
             if (table == null) continue;
+
+            if (idx.whereExpr != null && !matchesIndexWhere(idx, table, rowValues, 0)) continue;
 
             Record keyRecord = new Record();
             for (String idxCol : idx.columns) {
@@ -1261,12 +1336,85 @@ public class Database implements AutoCloseable {
             for (int i = 0; i < stmt.columns.size(); i++) {
                 if (i > 0) sb.append(", ");
                 IndexedColumn ic = stmt.columns.get(i);
-                sb.append(ic.expression);
+                if (ic.expression instanceof Expressions.ColumnRef) {
+                    sb.append(quoteIdentifier(((Expressions.ColumnRef) ic.expression).columnName));
+                } else if (ic.expression != null) {
+                    sb.append(ic.expression);
+                }
                 if (ic.order == Enums.OrderDirection.DESC) sb.append(" DESC");
             }
         }
         sb.append(")");
+        if (stmt.where != null) {
+            sb.append(" WHERE ").append(exprToSQL(stmt.where));
+        }
         return sb.toString();
+    }
+
+    private String exprToSQL(Expression expr) {
+        if (expr instanceof Expressions.Binary) {
+            Expressions.Binary bin = (Expressions.Binary) expr;
+            String op;
+            switch (bin.operator) {
+                case EQ: op = "="; break;
+                case NEQ: op = "!="; break;
+                case LT: op = "<"; break;
+                case LTE: op = "<="; break;
+                case GT: op = ">"; break;
+                case GTE: op = ">="; break;
+                case AND: op = "AND"; break;
+                case OR: op = "OR"; break;
+                case IS: op = "IS"; break;
+                case IS_NOT: op = "IS NOT"; break;
+                case LIKE: op = "LIKE"; break;
+                case GLOB: op = "GLOB"; break;
+                default: op = bin.operator.name(); break;
+            }
+            return exprToSQL(bin.left) + " " + op + " " + exprToSQL(bin.right);
+        } else if (expr instanceof Expressions.Unary) {
+            Expressions.Unary un = (Expressions.Unary) expr;
+            if (un.operator == Expressions.UnaryOp.NOT) return "NOT " + exprToSQL(un.operand);
+            return un.operator.name() + " " + exprToSQL(un.operand);
+        } else if (expr instanceof Expressions.ColumnRef) {
+            return ((Expressions.ColumnRef) expr).columnName;
+        } else if (expr instanceof Expressions.Literal) {
+            Expressions.Literal lit = (Expressions.Literal) expr;
+            if (lit.type == Expressions.Literal.Type.STRING) return "'" + lit.value.replace("'", "''") + "'";
+            if (lit.type == Expressions.Literal.Type.NULL) return "NULL";
+            return lit.value != null ? lit.value : "NULL";
+        } else if (expr instanceof Expressions.IsNull) {
+            Expressions.IsNull isn = (Expressions.IsNull) expr;
+            return exprToSQL(isn.expression) + (isn.isNotNull ? " IS NOT NULL" : " IS NULL");
+        } else if (expr instanceof Expressions.Between) {
+            Expressions.Between bt = (Expressions.Between) expr;
+            return exprToSQL(bt.expression) + (bt.not ? " NOT BETWEEN " : " BETWEEN ") + exprToSQL(bt.low) + " AND " + exprToSQL(bt.high);
+        } else if (expr instanceof Expressions.In) {
+            Expressions.In in = (Expressions.In) expr;
+            StringBuilder sb = new StringBuilder();
+            sb.append(exprToSQL(in.expression)).append(in.not ? " NOT IN (" : " IN (");
+            if (in.values != null) {
+                for (int i = 0; i < in.values.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(exprToSQL(in.values.get(i)));
+                }
+            }
+            sb.append(")");
+            return sb.toString();
+        } else if (expr instanceof Expressions.FunctionCall) {
+            Expressions.FunctionCall fc = (Expressions.FunctionCall) expr;
+            StringBuilder sb = new StringBuilder(fc.name).append("(");
+            if (fc.arguments != null) {
+                for (int i = 0; i < fc.arguments.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(exprToSQL(fc.arguments.get(i)));
+                }
+            }
+            sb.append(")");
+            return sb.toString();
+        } else if (expr instanceof Expressions.RowIdRef) {
+            return "rowid";
+        }
+        return "?";
     }
 
     private String quoteIdentifier(String id) {

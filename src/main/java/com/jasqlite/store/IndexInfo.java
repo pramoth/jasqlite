@@ -1,10 +1,8 @@
 package com.jasqlite.store;
 
+import com.jasqlite.sql.ast.Expression;
 import java.util.List;
 
-/**
- * Represents index metadata.
- */
 public class IndexInfo {
     public String name;
     public String tableName;
@@ -13,5 +11,6 @@ public class IndexInfo {
     public String sql;
     public List<String> columns;
     public List<Boolean> descending;
-    public String where; // partial index condition
+    public String where;
+    public Expression whereExpr;
 }
