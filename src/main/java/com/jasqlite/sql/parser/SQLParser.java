@@ -387,7 +387,7 @@ public class SQLParser {
     private ReindexStatement parseReindex() throws ParseException { ReindexStatement ri = new ReindexStatement(); expect(TokenType.REINDEX); if (!isAtEnd() && !check(TokenType.SEMICOLON)) ri.tableName = expectName(); return ri; }
     private AttachStatement parseAttach() throws ParseException { AttachStatement as = new AttachStatement(); expect(TokenType.ATTACH); match(TokenType.DATABASE); as.databasePath = parseExpression(); expect(TokenType.AS); as.databaseName = expectName(); return as; }
     private DetachStatement parseDetach() throws ParseException { DetachStatement ds = new DetachStatement(); expect(TokenType.DETACH); match(TokenType.DATABASE); ds.databaseName = expectName(); return ds; }
-    private ExplainStatement parseExplain() throws ParseException { ExplainStatement es = new ExplainStatement(); expect(TokenType.EXPLAIN); if (match(TokenType.QUERY)) expect(TokenType.PLAN); es.statement = parseStatement(); return es; }
+    private ExplainStatement parseExplain() throws ParseException { ExplainStatement es = new ExplainStatement(); expect(TokenType.EXPLAIN); if (match(TokenType.QUERY)) { expect(TokenType.PLAN); es.queryPlan = true; } es.statement = parseStatement(); return es; }
 
     // ==================== Expression Parser ====================
     private Expression parseExpression() throws ParseException { return parseOr(); }

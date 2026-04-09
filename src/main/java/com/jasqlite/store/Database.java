@@ -191,6 +191,26 @@ public class Database implements AutoCloseable {
         info.sql = entry.sql;
         info.columns = new ArrayList<>();
         info.descending = new ArrayList<>();
+        if (entry.sql != null) {
+            try {
+                Statement stmt = SQLParser.create(entry.sql).parse();
+                if (stmt instanceof CreateIndexStatement) {
+                    CreateIndexStatement ci = (CreateIndexStatement) stmt;
+                    info.unique = ci.unique;
+                    if (ci.columns != null) {
+                        for (IndexedColumn ic : ci.columns) {
+                            if (ic.expression instanceof Expressions.ColumnRef) {
+                                info.columns.add(((Expressions.ColumnRef) ic.expression).columnName);
+                            } else if (ic.expression != null) {
+                                info.columns.add(ic.expression.toString());
+                            }
+                            info.descending.add(ic.order == Enums.OrderDirection.DESC);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
         return info;
     }
 
@@ -309,7 +329,19 @@ public class Database implements AutoCloseable {
 
                 SchemaEntry entry = new SchemaEntry("index", stmt.indexName, stmt.tableName, rootPage, sql);
                 schemaEntries.put(stmt.indexName.toLowerCase(), entry);
-                indexes.put(stmt.indexName.toLowerCase(), parseIndexInfo(entry));
+                IndexInfo info = parseIndexInfo(entry);
+                if (stmt.columns != null) {
+                    for (IndexedColumn ic : stmt.columns) {
+                        if (ic.expression instanceof Expressions.ColumnRef) {
+                            info.columns.add(((Expressions.ColumnRef) ic.expression).columnName);
+                        } else if (ic.expression != null) {
+                            info.columns.add(ic.expression.toString());
+                        }
+                        info.descending.add(ic.order == Enums.OrderDirection.DESC);
+                    }
+                }
+                info.unique = stmt.unique;
+                indexes.put(stmt.indexName.toLowerCase(), info);
                 schemaCookie = pager.getSchemaCookie();
 
             } catch (IOException e) {

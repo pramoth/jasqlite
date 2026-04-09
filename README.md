@@ -1,108 +1,189 @@
 # JaSQLite
 
-A SQLite-compatible SQL engine written in pure Java that is **binary compatible with SQLite database files**. JaSQLite can read and write SQLite 3 format `.db` files and exposes a standard JDBC interface, requiring no native dependencies.
-
-**Compatible with SQLite 3.46.1**
+A SQLite-compatible SQL engine written entirely in Java. JaSQLite reads and writes the native SQLite database file format, making it **binary compatible** with SQLite — databases created by the C library can be opened by JaSQLite and vice versa.
 
 ## Features
 
-- **Binary Compatibility** — Reads and writes the SQLite 3 file format directly
-- **JDBC Interface** — Standard `java.sql` Driver, Connection, Statement, PreparedStatement, and ResultSet
-- **Full SQL Support** — SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE/INDEX/VIEW/TRIGGER, ALTER TABLE
-- **Query Capabilities** — WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT, subqueries
-- **Joins** — INNER, LEFT, RIGHT, FULL, CROSS
-- **50+ Built-in Functions** — String, math, date/time, aggregate, and type conversion functions
-- **B-Tree Storage** — Table and index B-trees following the SQLite page format
-- **Transactions** — BEGIN, COMMIT, ROLLBACK with journal-based recovery
-- **Page Cache** — LRU page cache with configurable size
-- **Interactive Shell** — Command-line REPL for executing SQL directly
-- **Zero Native Dependencies** — Pure Java, runs anywhere Java 11+ is available
+### Storage Engine
+- **Binary-compatible file format** — 100-byte SQLite header, B-tree pages, varint encoding
+- **B-tree storage** — table B-trees and index B-trees with leaf and interior pages, overflow page handling
+- **Write-Ahead Log (WAL)** support
+- **Page cache** with LRU eviction
+- **Record format** — SQLite serial type codes for NULL, INTEGER, FLOAT, TEXT, and BLOB
 
-## Requirements
+### SQL Support
+- `CREATE TABLE` / `DROP TABLE` with `IF NOT EXISTS` / `IF EXISTS`
+- `INSERT`, `UPDATE`, `DELETE`
+- `SELECT` with:
+  - `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`
+  - `GROUP BY` with `HAVING`
+  - `DISTINCT`
+  - Column aliases and table aliases
+  - `INNER JOIN`, `LEFT JOIN`, multi-table joins with `ON` conditions
+  - Subqueries (in `FROM`, `WHERE`, and expression positions)
+  - `IN`, `BETWEEN`, `LIKE`, `GLOB`, `EXISTS`, `IS NULL`, `CASE WHEN`
+  - `CAST` expressions
+- `CREATE INDEX` / `DROP INDEX` (including `UNIQUE` indexes)
+- `CREATE VIEW` / `DROP VIEW`
+- `EXPLAIN` and `EXPLAIN QUERY PLAN`
+- Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`
+- `PRAGMA` (read and write)
+- `ATTACH` / `DETACH` database
 
+### Built-in Functions (80+)
+| Category | Functions |
+|----------|-----------|
+| String | `upper`, `lower`, `length`, `substr`, `replace`, `trim`, `ltrim`, `rtrim`, `instr`, `printf`, `char`, `hex`, `unicode`, `quote`, `soundex`, `zeroblob`, `typeof` |
+| Math | `abs`, `ceil`, `floor`, `log`, `log2`, `ln`, `exp`, `power`, `sqrt`, `sign`, `mod`, `trunc`, `pi`, `round`, `random` |
+| Aggregate | `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat` |
+| Date/Time | `date`, `time`, `datetime`, `julianday`, `strftime`, `unixepoch` |
+| System | `coalesce`, `ifnull`, `iif`, `nullif`, `last_insert_rowid`, `changes` |
+
+### JDBC Driver
+Full JDBC implementation:
+- `java.sql.Driver` — auto-registers via `Class.forName("com.jasqlite.jdbc.JaSQLiteDriver")`
+- `Connection`, `Statement`, `PreparedStatement`, `ResultSet`
+- `DatabaseMetaData` — tables, columns, indexes, primary keys
+- Connection URL: `jdbc:jasqlite:/path/to/database.db`
+
+### SQLite Compatibility
+- `INTEGER PRIMARY KEY` as rowid alias
+- `sqlite_master` / `sqlite_schema` virtual tables
+- `?`, `?N`, `$name`, `:name`, `@name` parameter binding
+- SQLite-compatible type affinity (NULL, INTEGER, REAL, TEXT, BLOB)
+
+## Project Structure
+
+```
+src/main/java/com/jasqlite/
+├── JaSQLite.java                  # Main entry point and shell
+├── sql/
+│   ├── parser/
+│   │   ├── Lexer.java             # SQL tokenizer
+│   │   ├── SQLParser.java         # Recursive descent parser
+│   │   ├── Token.java             # Token representation
+│   │   └── TokenType.java         # All SQLite keyword tokens
+│   ├── ast/
+│   │   ├── Statement.java         # Base statement AST
+│   │   ├── SelectStatement.java
+│   │   ├── InsertStatement.java
+│   │   ├── Expressions.java       # All expression types
+│   │   └── ... (35+ AST node files)
+│   └── planner/
+│       └── QueryPlanner.java      # Query execution engine
+├── store/
+│   ├── Database.java              # Database facade
+│   ├── btree/BTree.java           # B-tree operations
+│   ├── page/
+│   │   ├── Page.java              # Page representation
+│   │   ├── Pager.java             # Page I/O and caching
+│   │   └── WALFile.java           # Write-Ahead Log
+│   ├── record/Record.java         # Record serialization
+│   ├── TableInfo.java, ColumnInfo.java, IndexInfo.java, SchemaEntry.java
+│   └── Result.java                # Query result container
+├── function/
+│   └── FunctionRegistry.java      # 80+ built-in functions
+├── jdbc/
+│   ├── JaSQLiteDriver.java
+│   ├── JaSQLiteConnection.java
+│   ├── JaSQLiteStatement.java
+│   ├── JaSQLitePreparedStatement.java
+│   ├── JaSQLiteResultSet.java
+│   ├── JaSQLiteResultSetMetaData.java
+│   └── JaSQLiteDatabaseMetaData.java
+├── vdbe/
+│   ├── VDBE.java                  # Virtual Database Engine
+│   ├── Opcode.java
+│   ├── Instruction.java
+│   └── Cursor.java
+└── util/
+    ├── SQLiteValue.java           # Value type system
+    └── BinaryUtils.java           # Varint and binary utilities
+```
+
+## Getting Started
+
+### Prerequisites
 - Java 11 or later
 - Maven 3.6+
 
-## Build
-
+### Build
 ```bash
 mvn clean package
 ```
 
-## Usage
-
-### Interactive Shell
-
-```bash
-java -jar target/jasqlite-1.0.0.jar mydb.db
-```
-
-Shell commands: `.quit`, `.tables`, `.schema`
-
-### JDBC
-
-```java
-import java.sql.*;
-
-// Register driver (auto-registered via SPI)
-Connection conn = DriverManager.getConnection("jdbc:jasqlite:mydb.db");
-Statement stmt = conn.createStatement();
-
-// Create a table
-stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
-
-// Insert data
-stmt.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')");
-
-// Query
-ResultSet rs = stmt.executeQuery("SELECT * FROM users WHERE name = 'Alice'");
-while (rs.next()) {
-    System.out.println(rs.getString("name") + " - " + rs.getString("email"));
-}
-
-conn.close();
-```
-
-### Programmatic API
-
-```java
-import com.jasqlite.JaSQLite;
-import java.sql.Connection;
-
-Connection conn = JaSQLite.createConnection("mydb.db");
-// use conn as a standard JDBC connection
-```
-
-## Architecture
-
-```
-SQL String
-  → Lexer → Tokens
-  → SQLParser → AST
-  → QueryPlanner → Storage Operations
-  → BTree / Pager / Record (SQLite file I/O)
-  → Result → JDBC ResultSet
-```
-
-| Layer | Package | Description |
-|-------|---------|-------------|
-| JDBC | `com.jasqlite.jdbc` | Standard java.sql interface implementation |
-| SQL Parser | `com.jasqlite.sql.parser` | Recursive descent SQL parser and lexer |
-| AST | `com.jasqlite.sql.ast` | Abstract syntax tree node classes |
-| Query Planner | `com.jasqlite.sql.planner` | Query execution and optimization |
-| Storage | `com.jasqlite.store` | Database, schema, and record management |
-| B-Tree | `com.jasqlite.store.btree` | B-tree index and table storage |
-| Pager | `com.jasqlite.store.page` | Page-level I/O, caching, and journaling |
-| VDBE | `com.jasqlite.vdbe` | Virtual database engine (bytecode executor) |
-| Functions | `com.jasqlite.function` | Built-in SQL function registry |
-| Utilities | `com.jasqlite.util` | SQLite value types and binary encoding |
-
-## Running Tests
-
+### Run Tests
 ```bash
 mvn test
 ```
 
+### Usage — Embedded API
+```java
+import com.jasqlite.store.Database;
+import com.jasqlite.store.Result;
+
+Database db = new Database("/path/to/my.db");
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+db.execute("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+
+Result result = db.execute("SELECT name, age FROM users WHERE age > 25");
+for (int i = 0; i < result.getRowCount(); i++) {
+    System.out.println(result.getValue(i, 0).asString() + ": " + result.getValue(i, 1).asLong());
+}
+
+db.close();
+```
+
+### Usage — JDBC
+```java
+import java.sql.*;
+
+Class.forName("com.jasqlite.jdbc.JaSQLiteDriver");
+
+try (Connection conn = DriverManager.getConnection("jdbc:jasqlite:/path/to/my.db")) {
+    Statement stmt = conn.createStatement();
+    stmt.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)");
+
+    PreparedStatement ps = conn.prepareStatement("INSERT INTO products (name, price) VALUES (?, ?)");
+    ps.setString(1, "Widget");
+    ps.setDouble(2, 9.99);
+    ps.executeUpdate();
+
+    ResultSet rs = stmt.executeQuery("SELECT name, price FROM products");
+    while (rs.next()) {
+        System.out.println(rs.getString("name") + ": $" + rs.getDouble("price"));
+    }
+}
+```
+
+### Usage — Shell Mode
+```bash
+java -jar target/jasqlite-1.0.0.jar /path/to/my.db
+```
+
+### Usage — EXPLAIN QUERY PLAN
+```java
+Result plan = db.execute("EXPLAIN QUERY PLAN SELECT e.name, d.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id");
+// Returns: selectid, order, from, detail columns
+// e.g. "SCAN TABLE employees AS e", "INNER JOIN SCAN TABLE departments AS d ON ..."
+```
+
+## Architecture
+
+JaSQLite implements the core components of a relational database engine:
+
+1. **Storage Layer** — Reads and writes the SQLite binary file format directly. Pages are managed through a pager with an LRU cache, journal-based rollback, and optional WAL mode.
+
+2. **B-Tree Engine** — Implements table B-trees (clustered on rowid) and index B-trees. Handles leaf and interior pages, cell insertion/deletion, and page splitting.
+
+3. **SQL Parser** — Hand-written recursive descent parser covering the full SQLite SQL grammar. Produces an AST with typed expression nodes.
+
+4. **Query Planner** — Walks the AST and executes queries against the storage engine. Handles joins (via nested loop), aggregates, grouping, ordering, and filtering.
+
+5. **VDBE** — Virtual Database Engine with an opcode-based instruction set, modeled after SQLite's VDBE.
+
+6. **JDBC Driver** — Standard JDBC 4.2 implementation so JaSQLite can be used as a drop-in replacement for the SQLite JDBC driver in Java applications.
+
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is provided as-is for educational and research purposes.

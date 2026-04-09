@@ -1119,8 +1119,13 @@ public class QueryPlanner {
     }
 
     private Result executeExplain(ExplainStatement stmt) throws Exception {
-        if (stmt.statement != null) {
-            // Return a description of how the statement would be executed
+        if (stmt.statement == null) return Result.EMPTY;
+
+        if (stmt.queryPlan) {
+            // EXPLAIN QUERY PLAN: return a high-level query plan
+            return buildQueryPlan(stmt.statement);
+        } else {
+            // EXPLAIN: return VDBE-style opcodes
             String[] cols = {"addr", "opcode", "p1", "p2", "p3", "p4", "comment"};
             List<SQLiteValue[]> rows = new ArrayList<>();
             rows.add(new SQLiteValue[]{SQLiteValue.fromLong(0), SQLiteValue.fromText("Trace"),
@@ -1128,7 +1133,263 @@ public class QueryPlanner {
                 SQLiteValue.fromNull(), SQLiteValue.fromText(stmt.statement.getClass().getSimpleName())});
             return Result.query(cols, rows);
         }
-        return Result.EMPTY;
+    }
+
+    private Result buildQueryPlan(Statement stmt) {
+        String[] cols = {"selectid", "order", "from", "detail"};
+        List<SQLiteValue[]> rows = new ArrayList<>();
+        int[] order = {0};
+
+        if (stmt instanceof SelectStatement) {
+            buildSelectPlan((SelectStatement) stmt, rows, order);
+        } else if (stmt instanceof InsertStatement) {
+            InsertStatement ins = (InsertStatement) stmt;
+            TableInfo table = db.getTable(ins.tableName);
+            rows.add(planRow(0, order[0]++, 0, "INSERT INTO " + ins.tableName + " (rowid=" + (table != null ? table.rootPage : "?") + ")"));
+        } else if (stmt instanceof UpdateStatement) {
+            UpdateStatement upd = (UpdateStatement) stmt;
+            TableInfo table = db.getTable(upd.tableName);
+            rows.add(planRow(0, order[0]++, 0, "UPDATE " + upd.tableName + " (rowid=" + (table != null ? table.rootPage : "?") + ")"));
+        } else if (stmt instanceof DeleteStatement) {
+            DeleteStatement del = (DeleteStatement) stmt;
+            TableInfo table = db.getTable(del.tableName);
+            rows.add(planRow(0, order[0]++, 0, "DELETE FROM " + del.tableName + " (rowid=" + (table != null ? table.rootPage : "?") + ")"));
+        } else {
+            rows.add(planRow(0, 0, 0, stmt.getClass().getSimpleName()));
+        }
+
+        return Result.query(cols, rows);
+    }
+
+    private void buildSelectPlan(SelectStatement sel, List<SQLiteValue[]> rows, int[] order) {
+        if (sel.from == null || sel.from.isEmpty()) {
+            rows.add(planRow(0, order[0]++, 0, "SCAN CONSTANT ROW"));
+            return;
+        }
+
+        Map<String, List<Expression>> constraints = new LinkedHashMap<>();
+        if (sel.where != null) {
+            extractColumnConstraints(sel.where, constraints);
+        }
+
+        int fromIdx = 0;
+        for (TableOrSubquery tos : sel.from) {
+            if (tos.type == TableOrSubquery.Type.JOIN) {
+                collectJoinPlanTables(tos, rows, order, 0, sel.where);
+            } else if (tos.type == TableOrSubquery.Type.TABLE) {
+                String tblName = tos.alias != null ? tos.alias : tos.tableName;
+                String detail = buildScanOrSearchDetail(tos, tblName, sel.where, constraints);
+                rows.add(planRow(0, order[0]++, fromIdx, detail));
+                fromIdx++;
+            } else if (tos.type == TableOrSubquery.Type.SUBQUERY) {
+                String alias = tos.alias != null ? tos.alias : "subquery";
+                rows.add(planRow(0, order[0]++, fromIdx, "SCAN SUBQUERY " + alias));
+                fromIdx++;
+            }
+        }
+
+        if (sel.where != null) {
+            rows.add(planRow(0, order[0]++, 0, "FILTER " + exprToString(sel.where)));
+        }
+
+        if (sel.groupBy != null && !sel.groupBy.isEmpty()) {
+            rows.add(planRow(0, order[0]++, 0, "USE GROUP BY"));
+        }
+
+        if (sel.orderBy != null && !sel.orderBy.isEmpty()) {
+            rows.add(planRow(0, order[0]++, 0, "USE ORDER BY"));
+        }
+
+        if (sel.distinct) {
+            rows.add(planRow(0, order[0]++, 0, "USE DISTINCT"));
+        }
+
+        if (sel.limit != null) {
+            rows.add(planRow(0, order[0]++, 0, "USE LIMIT"));
+        }
+    }
+
+    private void collectJoinPlanTables(TableOrSubquery join, List<SQLiteValue[]> rows, int[] order, int depth, Expression whereExpr) {
+        if (join.left != null) {
+            if (join.left.type == TableOrSubquery.Type.JOIN) {
+                collectJoinPlanTables(join.left, rows, order, depth + 1, whereExpr);
+            } else if (join.left.type == TableOrSubquery.Type.TABLE) {
+                String tblName = join.left.alias != null ? join.left.alias : join.left.tableName;
+                Map<String, List<Expression>> constraints = new LinkedHashMap<>();
+                if (whereExpr != null) extractColumnConstraints(whereExpr, constraints);
+                if (join.onCondition != null) extractColumnConstraints(join.onCondition, constraints);
+                String detail = buildScanOrSearchDetail(join.left, tblName, whereExpr, constraints);
+                rows.add(planRow(0, order[0]++, 0, detail));
+            }
+        }
+
+        if (join.right != null) {
+            Map<String, List<Expression>> constraints = new LinkedHashMap<>();
+            if (join.onCondition != null) extractColumnConstraints(join.onCondition, constraints);
+            String tblName = join.right.alias != null ? join.right.alias : join.right.tableName;
+            String detail = buildScanOrSearchDetail(join.right, tblName, join.onCondition, constraints);
+            String joinType = join.joinType != null ? join.joinType.name() : "INNER";
+
+            if (join.onCondition != null) {
+                detail = joinType + " JOIN " + detail + " ON " + exprToString(join.onCondition);
+            } else {
+                detail = joinType + " JOIN " + detail;
+            }
+            rows.add(planRow(0, order[0]++, 1, detail));
+        }
+    }
+
+    private void extractColumnConstraints(Expression expr, Map<String, List<Expression>> constraints) {
+        if (expr instanceof Expressions.Binary) {
+            Expressions.Binary bin = (Expressions.Binary) expr;
+            if (bin.operator == BinaryOp.AND) {
+                extractColumnConstraints(bin.left, constraints);
+                extractColumnConstraints(bin.right, constraints);
+                return;
+            }
+            if (bin.operator == BinaryOp.EQ || bin.operator == BinaryOp.LT || bin.operator == BinaryOp.LTE
+                || bin.operator == BinaryOp.GT || bin.operator == BinaryOp.GTE
+                || bin.operator == BinaryOp.IS || bin.operator == BinaryOp.IS_NOT) {
+                String colName = extractColumnName(bin.left);
+                if (colName == null) colName = extractColumnName(bin.right);
+                if (colName != null) {
+                    constraints.computeIfAbsent(colName.toLowerCase(), k -> new ArrayList<>()).add(expr);
+                }
+            }
+        } else if (expr instanceof Expressions.In) {
+            Expressions.In inExpr = (Expressions.In) expr;
+            String colName = extractColumnName(inExpr.expression);
+            if (colName != null) {
+                constraints.computeIfAbsent(colName.toLowerCase(), k -> new ArrayList<>()).add(expr);
+            }
+        } else if (expr instanceof Expressions.Between) {
+            Expressions.Between btw = (Expressions.Between) expr;
+            String colName = extractColumnName(btw.expression);
+            if (colName != null) {
+                constraints.computeIfAbsent(colName.toLowerCase(), k -> new ArrayList<>()).add(expr);
+            }
+        } else if (expr instanceof Expressions.IsNull) {
+            Expressions.IsNull isNull = (Expressions.IsNull) expr;
+            String colName = extractColumnName(isNull.expression);
+            if (colName != null) {
+                constraints.computeIfAbsent(colName.toLowerCase(), k -> new ArrayList<>()).add(expr);
+            }
+        }
+    }
+
+    private String extractColumnName(Expression expr) {
+        if (expr instanceof Expressions.ColumnRef) {
+            return ((Expressions.ColumnRef) expr).columnName;
+        }
+        if (expr instanceof Expressions.RowIdRef) {
+            return "rowid";
+        }
+        return null;
+    }
+
+    private IndexInfo findMatchingIndex(String tableName, Map<String, List<Expression>> constraints) {
+        if (constraints == null || constraints.isEmpty()) return null;
+        TableInfo table = db.getTable(tableName);
+        if (table == null) return null;
+
+        IndexInfo best = null;
+        int bestPrefixLen = 0;
+
+        for (IndexInfo idx : db.getIndexes()) {
+            if (!idx.tableName.equalsIgnoreCase(tableName)) continue;
+            if (idx.columns == null || idx.columns.isEmpty()) continue;
+
+            int prefixLen = 0;
+            for (String idxCol : idx.columns) {
+                if (constraints.containsKey(idxCol.toLowerCase())) {
+                    prefixLen++;
+                } else {
+                    break;
+                }
+            }
+            if (prefixLen > bestPrefixLen) {
+                bestPrefixLen = prefixLen;
+                best = idx;
+            }
+        }
+
+        if (bestPrefixLen == 0) return null;
+        return best;
+    }
+
+    private String buildScanOrSearchDetail(TableOrSubquery tos, String displayTableName,
+                                            Expression whereExpr, Map<String, List<Expression>> constraints) {
+        String tblName = tos.tableName;
+        String alias = tos.alias;
+        TableInfo table = db.getTable(tblName);
+
+        IndexInfo matchedIndex = null;
+        if (tos.notIndexed) {
+            // NOT INDEXED forced
+        } else if (tos.indexed && tos.indexName != null) {
+            IndexInfo forced = db.getIndex(tos.indexName);
+            if (forced != null) matchedIndex = forced;
+        } else {
+            matchedIndex = findMatchingIndex(tblName, constraints);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (matchedIndex != null) {
+            sb.append("SEARCH TABLE ").append(tblName);
+            if (alias != null && !alias.equalsIgnoreCase(tblName)) {
+                sb.append(" AS ").append(alias);
+            }
+            sb.append(" USING INDEX ").append(matchedIndex.name);
+            sb.append(" (");
+            for (int i = 0; i < matchedIndex.columns.size(); i++) {
+                String col = matchedIndex.columns.get(i);
+                if (i > 0) sb.append(" AND ");
+                if (constraints.containsKey(col.toLowerCase())) {
+                    sb.append(col).append("=?");
+                } else {
+                    sb.append(col).append(">?");
+                }
+            }
+            sb.append(")");
+            if (table != null) {
+                sb.append(" (~").append(estimateRowCount(table)).append(" rows)");
+            }
+        } else {
+            sb.append("SCAN TABLE ").append(tblName);
+            if (alias != null && !alias.equalsIgnoreCase(tblName)) {
+                sb.append(" AS ").append(alias);
+            }
+            if (table != null) {
+                sb.append(" (~").append(estimateRowCount(table)).append(" rows)");
+            }
+        }
+        return sb.toString();
+    }
+
+    private SQLiteValue[] planRow(int selectId, int order, int from, String detail) {
+        return new SQLiteValue[]{
+            SQLiteValue.fromLong(selectId),
+            SQLiteValue.fromLong(order),
+            SQLiteValue.fromLong(from),
+            SQLiteValue.fromText(detail)
+        };
+    }
+
+    private long estimateRowCount(TableInfo table) {
+        try {
+            return db.getBTree().scanTable(table.rootPage).size();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private String exprToString(Expression expr) {
+        if (expr == null) return "";
+        // Use the AST's toString for a readable representation
+        String s = expr.toString();
+        // Truncate very long expressions
+        if (s.length() > 80) return s.substring(0, 77) + "...";
+        return s;
     }
 
     // ==================== Helper Methods ====================
