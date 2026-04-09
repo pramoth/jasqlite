@@ -97,9 +97,38 @@ public class SQLParser {
             case ATTACH: return parseAttach();
             case DETACH: return parseDetach();
             case EXPLAIN: return parseExplain();
-            case WITH: advance(); match(TokenType.RECURSIVE);
-                while (!check(TokenType.SELECT)) advance();
-                return parseSelect();
+            case WITH: {
+                advance();
+                boolean isRecursive = match(TokenType.RECURSIVE);
+                List<CTEDefinition> cteList = new ArrayList<>();
+                do {
+                    CTEDefinition cte = new CTEDefinition();
+                    cte.name = expectName();
+                    if (check(TokenType.LPAREN)) {
+                        int save = pos;
+                        advance();
+                        if (!check(TokenType.SELECT) && !check(TokenType.RPAREN) &&
+                            (check(TokenType.IDENTIFIER) || peek().isKeyword())) {
+                            cte.columnNames = new ArrayList<>();
+                            do { cte.columnNames.add(expectName()); } while (match(TokenType.COMMA));
+                            expect(TokenType.RPAREN);
+                        } else {
+                            pos = save;
+                        }
+                    }
+                    expect(TokenType.AS);
+                    expect(TokenType.LPAREN);
+                    cte.select = parseSelect();
+                    expect(TokenType.RPAREN);
+                    cteList.add(cte);
+                } while (match(TokenType.COMMA));
+                Statement mainStmt = parseStatement();
+                if (mainStmt instanceof SelectStatement) {
+                    ((SelectStatement) mainStmt).ctes = cteList;
+                    ((SelectStatement) mainStmt).recursive = isRecursive;
+                }
+                return mainStmt;
+            }
             default:
                 throw new ParseException("Unexpected token: " + t.type + "('" + t.value + "')", t.position);
         }

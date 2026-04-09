@@ -20,6 +20,7 @@ public class QueryPlanner {
 
     private final Database db;
     private int changesCount;
+    private final Map<String, List<TableRow>> cteResults = new LinkedHashMap<>();
 
     public QueryPlanner(Database db) {
         this.db = db;
@@ -55,24 +56,32 @@ public class QueryPlanner {
     // ==================== SELECT ====================
 
     private Result executeSelect(SelectStatement sel, SQLiteValue[] params) throws Exception {
-        // Handle CTEs (WITH clause) - store as temporary views
-        // For now, handle basic SELECT
-
-        if (sel.from == null || sel.from.isEmpty()) {
-            // SELECT without FROM (e.g., SELECT 1+2)
-            return executeSelectWithoutFrom(sel, params);
+        boolean hasCTEs = sel.ctes != null && !sel.ctes.isEmpty();
+        if (hasCTEs) {
+            materializeCTEs(sel.ctes, sel.recursive, params);
         }
 
-        // Get rows from first table
+        try {
+
         List<SQLiteValue[]> rows = new ArrayList<>();
-        List<String> columnNames = new ArrayList<>();
+        List<String> resolvedNames;
+        List<TableRow> tableRows = null;
+        TableOrSubquery from = null;
+
+        if (sel.from == null || sel.from.isEmpty()) {
+            Result noFromResult = executeSelectWithoutFrom(sel, params);
+            resolvedNames = new ArrayList<>(Arrays.asList(noFromResult.getColumnNames()));
+            for (int i = 0; i < noFromResult.getRowCount(); i++) {
+                SQLiteValue[] row = new SQLiteValue[noFromResult.getColumnCount()];
+                for (int j = 0; j < row.length; j++) row[j] = noFromResult.getValue(i, j);
+                rows.add(row);
+            }
+        } else {
 
         // Process FROM clause
-        TableOrSubquery from = sel.from.get(0);
-        List<TableRow> tableRows;
+        from = sel.from.get(0);
 
         if (from.type == TableOrSubquery.Type.JOIN) {
-            // First element is a JOIN - resolve recursively
             tableRows = resolveJoinTree(from, params);
         } else {
             tableRows = resolveTable(from, params);
@@ -85,9 +94,7 @@ public class QueryPlanner {
                 List<TableRow> rightRows = resolveTable(joinClause.right, params);
                 tableRows = executeJoin(tableRows, rightRows, joinClause, params);
             } else if (joinClause.type == TableOrSubquery.Type.TABLE || joinClause.type == TableOrSubquery.Type.SUBQUERY) {
-                // Cross join (comma-separated FROM)
                 List<TableRow> rightRows = resolveTable(joinClause, params);
-                // Cross join: cartesian product
                 List<TableRow> crossResult = new ArrayList<>();
                 for (TableRow left : tableRows) {
                     for (TableRow right : rightRows) {
@@ -99,7 +106,7 @@ public class QueryPlanner {
         }
 
         // Resolve column names from result columns
-        List<String> resolvedNames = resolveColumnNames(sel.columns, from);
+        resolvedNames = resolveColumnNames(sel.columns, from);
 
         // Apply WHERE filter
         if (sel.where != null) {
@@ -125,7 +132,6 @@ public class QueryPlanner {
                 groups.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(tr);
             }
 
-            // Evaluate result columns for each group (with aggregate support)
             List<TableRow> groupedRows = new ArrayList<>();
             for (Map.Entry<String, List<TableRow>> entry : groups.entrySet()) {
                 TableRow groupRow = createGroupRow(entry.getValue(), from);
@@ -133,7 +139,6 @@ public class QueryPlanner {
             }
             tableRows = groupedRows;
 
-            // Apply HAVING
             if (sel.having != null) {
                 List<TableRow> havingFiltered = new ArrayList<>();
                 for (TableRow tr : tableRows) {
@@ -151,10 +156,8 @@ public class QueryPlanner {
             List<SQLiteValue> rowValues = new ArrayList<>();
             for (ResultColumn rc : sel.columns) {
                 if (rc.isStar) {
-                    // SELECT *
                     rowValues.addAll(Arrays.asList(tr.values));
                 } else if (rc.starTableName != null) {
-                    // SELECT t.*
                     rowValues.addAll(Arrays.asList(tr.values));
                 } else {
                     SQLiteValue val = evaluateExpression(rc.expression, tr, params);
@@ -164,8 +167,26 @@ public class QueryPlanner {
             rows.add(rowValues.toArray(new SQLiteValue[0]));
         }
 
+        } // end else (has FROM)
+
+        // Handle UNION/compound
+        if (sel.unions != null && !sel.unions.isEmpty() && sel.unionType != Enums.UnionType.NONE) {
+            for (SelectStatement unionSel : sel.unions) {
+                Result unionResult = executeSelect(unionSel, params);
+                for (int i = 0; i < unionResult.getRowCount(); i++) {
+                    SQLiteValue[] row = new SQLiteValue[unionResult.getColumnCount()];
+                    for (int j = 0; j < row.length; j++) row[j] = unionResult.getValue(i, j);
+                    rows.add(row);
+                }
+            }
+        }
+
         // Apply DISTINCT
-        if (sel.distinct && !rows.isEmpty()) {
+        boolean needsDistinct = sel.distinct;
+        if (sel.unionType == Enums.UnionType.UNION || sel.unionType == Enums.UnionType.INTERSECT || sel.unionType == Enums.UnionType.EXCEPT) {
+            needsDistinct = true;
+        }
+        if (needsDistinct && !rows.isEmpty()) {
             Set<String> seen = new LinkedHashSet<>();
             List<SQLiteValue[]> distinctRows = new ArrayList<>();
             for (SQLiteValue[] row : rows) {
@@ -222,6 +243,14 @@ public class QueryPlanner {
         }
 
         return Result.query(resolvedNames.toArray(new String[0]), rows);
+
+        } finally {
+            if (hasCTEs) {
+                for (CTEDefinition cte : sel.ctes) {
+                    cteResults.remove(cte.name.toLowerCase());
+                }
+            }
+        }
     }
 
     private Result executeSelectWithoutFrom(SelectStatement sel, SQLiteValue[] params) {
@@ -253,6 +282,24 @@ public class QueryPlanner {
 
     private List<TableRow> resolveTable(TableOrSubquery tos, SQLiteValue[] params) throws Exception {
         if (tos.type == TableOrSubquery.Type.TABLE) {
+            String cteKey = tos.tableName != null ? tos.tableName.toLowerCase() : null;
+            if (cteKey != null && cteResults.containsKey(cteKey)) {
+                List<TableRow> cteRows = cteResults.get(cteKey);
+                List<TableRow> rows = new ArrayList<>();
+                String alias = tos.alias != null ? tos.alias : tos.tableName;
+                for (TableRow orig : cteRows) {
+                    TableRow tr = new TableRow();
+                    tr.tableName = alias;
+                    tr.columnNames = new ArrayList<>(orig.columnNames);
+                    tr.tableNames = new ArrayList<>();
+                    for (int i = 0; i < tr.columnNames.size(); i++) tr.tableNames.add(alias);
+                    tr.values = Arrays.copyOf(orig.values, orig.values.length);
+                    tr.rowid = orig.rowid;
+                    rows.add(tr);
+                }
+                return rows;
+            }
+
             // Handle sqlite_master / sqlite_schema as a virtual table
             String tblName = tos.tableName.toLowerCase();
             if ("sqlite_master".equals(tblName) || "sqlite_schema".equals(tblName)) {
@@ -451,15 +498,25 @@ public class QueryPlanner {
         for (ResultColumn rc : columns) {
             if (rc.isStar) {
                 if (from != null) {
-                    TableInfo table = db.getTable(from.tableName);
-                    if (table != null && table.columns != null) {
-                        for (ColumnInfo ci : table.columns) names.add(ci.name);
+                    String cteKey = from.tableName != null ? from.tableName.toLowerCase() : null;
+                    if (cteKey != null && cteResults.containsKey(cteKey) && !cteResults.get(cteKey).isEmpty()) {
+                        names.addAll(cteResults.get(cteKey).get(0).columnNames);
+                    } else {
+                        TableInfo table = db.getTable(from.tableName);
+                        if (table != null && table.columns != null) {
+                            for (ColumnInfo ci : table.columns) names.add(ci.name);
+                        }
                     }
                 }
             } else if (rc.starTableName != null) {
-                TableInfo table = db.getTable(from != null ? from.tableName : rc.starTableName);
-                if (table != null && table.columns != null) {
-                    for (ColumnInfo ci : table.columns) names.add(ci.name);
+                String cteKey = rc.starTableName.toLowerCase();
+                if (cteResults.containsKey(cteKey) && !cteResults.get(cteKey).isEmpty()) {
+                    names.addAll(cteResults.get(cteKey).get(0).columnNames);
+                } else {
+                    TableInfo table = db.getTable(from != null ? from.tableName : rc.starTableName);
+                    if (table != null && table.columns != null) {
+                        for (ColumnInfo ci : table.columns) names.add(ci.name);
+                    }
                 }
             } else {
                 names.add(rc.alias != null ? rc.alias :
@@ -846,6 +903,74 @@ public class QueryPlanner {
             result[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
         }
         return result;
+    }
+
+    // ==================== CTE Materialization ====================
+
+    private void materializeCTEs(List<CTEDefinition> ctes, boolean recursive, SQLiteValue[] params) throws Exception {
+        for (CTEDefinition cte : ctes) {
+            if (recursive && cte.select.unionType == Enums.UnionType.UNION_ALL
+                && cte.select.unions != null && !cte.select.unions.isEmpty()) {
+                materializeRecursiveCTE(cte, params);
+            } else {
+                materializeOrdinaryCTE(cte, params);
+            }
+        }
+    }
+
+    private void materializeOrdinaryCTE(CTEDefinition cte, SQLiteValue[] params) throws Exception {
+        Result result = executeSelect(cte.select, params);
+        List<TableRow> rows = resultToTableRows(result, cte);
+        cteResults.put(cte.name.toLowerCase(), rows);
+    }
+
+    private void materializeRecursiveCTE(CTEDefinition cte, SQLiteValue[] params) throws Exception {
+        SelectStatement cteSelect = cte.select;
+        List<String> cteColNames = cte.columnNames;
+
+        SelectStatement baseSelect = new SelectStatement();
+        baseSelect.columns = cteSelect.columns;
+        baseSelect.from = cteSelect.from;
+        baseSelect.where = cteSelect.where;
+        baseSelect.groupBy = cteSelect.groupBy;
+        baseSelect.having = cteSelect.having;
+
+        Result baseResult = executeSelect(baseSelect, params);
+        List<TableRow> allRows = resultToTableRows(baseResult, cte);
+        List<TableRow> workingTable = new ArrayList<>(allRows);
+
+        if (cteSelect.unions != null && !cteSelect.unions.isEmpty()) {
+            SelectStatement recursiveSelect = cteSelect.unions.get(0);
+            int maxIterations = 10000;
+            for (int i = 0; i < maxIterations && !workingTable.isEmpty(); i++) {
+                cteResults.put(cte.name.toLowerCase(), workingTable);
+                Result recursiveResult = executeSelect(recursiveSelect, params);
+                List<TableRow> newRows = resultToTableRows(recursiveResult, cte);
+                if (newRows.isEmpty()) break;
+                allRows.addAll(newRows);
+                workingTable = newRows;
+            }
+        }
+
+        cteResults.put(cte.name.toLowerCase(), allRows);
+    }
+
+    private List<TableRow> resultToTableRows(Result result, CTEDefinition cte) {
+        List<TableRow> rows = new ArrayList<>();
+        List<String> colNames = cte.columnNames != null ? cte.columnNames :
+            (result.getColumnNames() != null ? Arrays.asList(result.getColumnNames()) : new ArrayList<>());
+
+        for (int i = 0; i < result.getRowCount(); i++) {
+            TableRow tr = new TableRow();
+            tr.tableName = cte.name;
+            tr.columnNames = new ArrayList<>(colNames);
+            tr.tableNames = new ArrayList<>();
+            for (int j = 0; j < tr.columnNames.size(); j++) tr.tableNames.add(cte.name);
+            tr.values = new SQLiteValue[result.getColumnCount()];
+            for (int j = 0; j < tr.values.length; j++) tr.values[j] = result.getValue(i, j);
+            rows.add(tr);
+        }
+        return rows;
     }
 
     // ==================== INSERT ====================

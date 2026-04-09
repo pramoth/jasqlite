@@ -14,4 +14,6 @@ public class SelectStatement extends Statement {
     public Expression offset;
     public List<SelectStatement> unions;
     public Enums.UnionType unionType;
+    public List<CTEDefinition> ctes;
+    public boolean recursive;
 }
